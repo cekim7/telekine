@@ -1,0 +1,16 @@
+[package]
+name = "telekine-sim"
+description = "1,000-actuator dual-radio swarm simulator verifying Twin-Cast deduplication, 3ms Hot-Warm failover, Limp Mode, Sync-and-Fire, and Watchdog fail-safe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "telekine-sim"
+path = "src/main.rs"
+
+[dependencies]
+telekine-proto = { path = "../telekine-proto" }
+telekine-core = { path = "../telekine-core" }
+telekine-firmware = { path = "../telekine-firmware" }
+telekine-host = { path = "../telekine-host" }

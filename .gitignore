@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.Best
+.DS_Store
+__pycache__/
+*.pyc
+*.whl
+.env

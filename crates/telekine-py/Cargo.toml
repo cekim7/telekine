@@ -1,0 +1,16 @@
+[package]
+name = "telekine-py"
+description = "Python AI Agent SDK & LLM/MCP bounded-intent schema bridge for Telekine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "telekine_py"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+telekine-proto = { path = "../telekine-proto" }
+telekine-core = { path = "../telekine-core" }
+telekine-host = { path = "../telekine-host" }

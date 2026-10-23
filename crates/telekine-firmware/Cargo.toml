@@ -1,0 +1,10 @@
+[package]
+name = "telekine-firmware"
+description = "no_std ESP32-S3/C3 (ESP-NOW WMM AC_VO + dynamic peer table) and Semtech SX1262 (Raw LoRa SF7 VIP) hardware abstraction layer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+telekine-proto = { path = "../telekine-proto" }
+telekine-core = { path = "../telekine-core" }

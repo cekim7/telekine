@@ -1,0 +1,11 @@
+[package]
+name = "telekine-host"
+description = "AI Hub coordinator: 1,000+ node state table, 3ms Hot-Warm failover engine, Hot-Hot Twin-Cast, Triple-Burst broadcast, and TDMA Master Manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+telekine-proto = { path = "../telekine-proto" }
+telekine-core = { path = "../telekine-core" }
+telekine-firmware = { path = "../telekine-firmware" }

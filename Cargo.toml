@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/telekine-proto",
+    "crates/telekine-core",
+    "crates/telekine-firmware",
+    "crates/telekine-host",
+    "crates/telekine-sim",
+    "crates/telekine-py",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/telekine-ai/telekine"
+authors = ["Telekine Contributors"]

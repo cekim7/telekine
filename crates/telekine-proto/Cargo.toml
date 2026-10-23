@@ -1,0 +1,10 @@
+[package]
+name = "telekine-proto"
+description = "no_std 32-byte binary wire protocol, bounded AI intents, and per-device AES-128-GCM security for Telekine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "telekine_proto"
+path = "src/lib.rs"

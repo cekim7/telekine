@@ -1,0 +1,9 @@
+[package]
+name = "telekine-core"
+description = "no_std actuator safety state machine, Dual-Link Watchdog Lease, Limp Mode, Sync-and-Fire buffer, and TDMA scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+telekine-proto = { path = "../telekine-proto" }
