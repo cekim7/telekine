@@ -52,3 +52,6 @@ dependencies = [
 [[package]]
 name = "telekine-twin"
 version = "0.1.0"
+dependencies = [
+ "telekine-proto",
+]

@@ -7,3 +7,4 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+telekine-proto = { path = "../telekine-proto" }
