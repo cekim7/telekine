@@ -19,6 +19,12 @@
 
 use telekine_proto::{EncryptedFrame, Priority, RadioLink, WIRE_PACKET_SIZE};
 
+pub mod universal_driver;
+pub use universal_driver::{
+    AttachedHardwareDescriptor, HardwarePersonality, UniversalDriverBusHal,
+    UniversalDriverController, UniversalPinCommand,
+};
+
 /// 802.11 WMM / EDCA Access Category for controlling ESP-NOW hardware CSMA/CA backoff time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
