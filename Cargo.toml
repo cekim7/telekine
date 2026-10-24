@@ -7,6 +7,7 @@ members = [
     "crates/telekine-host",
     "crates/telekine-sim",
     "crates/telekine-py",
+    "crates/telekine-twin",
 ]
 
 [workspace.package]
