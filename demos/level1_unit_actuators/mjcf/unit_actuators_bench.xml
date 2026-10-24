@@ -1,0 +1,85 @@
+<mujoco model="telekine_level1_unit_actuators_bench">
+  <compiler angle="degree" coordinate="local" inertiafromgeom="true"/>
+  <option timestep="0.001" gravity="0 0 -9.81" integrator="RK4"/>
+
+  <default>
+    <joint armature="0.01" damping="0.1" limited="true"/>
+    <geom contype="1" conaffinity="1" friction="0.8 0.1 0.1"/>
+  </default>
+
+  <asset>
+    <texture name="grid" type="2d" builtin="checker" rgb1=".15 .18 .22" rgb2=".22 .26 .32" width="512" height="512"/>
+    <material name="grid_mat" texture="grid" texrepeat="8 8" reflectance="0.1"/>
+    <material name="servo_mat" rgba="0.15 0.65 0.95 1"/>
+    <material name="stepper_mat" rgba="0.20 0.85 0.45 1"/>
+    <material name="dc_mat" rgba="0.95 0.50 0.15 1"/>
+    <material name="stamp_pcb" rgba="0.10 0.35 0.20 1"/>
+  </asset>
+
+  <worldbody>
+    <light directional="true" diffuse=".8 .8 .8" specular=".2 .2 .2" pos="0 0 3" dir="0 0 -1"/>
+    <geom name="floor" type="plane" size="2 2 0.05" material="grid_mat"/>
+
+    <!-- Optical Test Bench Table -->
+    <body name="test_bench" pos="0 0 0.4">
+      <geom name="table_top" type="box" size="0.6 0.3 0.02" rgba="0.25 0.27 0.30 1"/>
+
+      <!-- ================================================================= -->
+      <!-- UNIT #101: SERVO ACTUATOR RIG (-90 to +90 deg PWM Horn)           -->
+      <!-- ================================================================= -->
+      <body name="unit_101_servo_mount" pos="-0.35 0 0.05">
+        <geom name="servo_body" type="box" size="0.02 0.01 0.02" rgba="0.2 0.2 0.2 1"/>
+        <geom name="servo_telekine_stamp" type="box" pos="0 -0.015 0" size="0.014 0.002 0.014" material="stamp_pcb"/>
+        <body name="unit_101_servo_horn" pos="0 0 0.025">
+          <joint name="joint_101_servo" type="hinge" axis="0 0 1" range="-90 90" damping="0.05"/>
+          <geom name="servo_arm_geom" type="capsule" fromto="0 0 0 0.08 0 0" size="0.008" material="servo_mat"/>
+          <site name="servo_tip_site" pos="0.08 0 0" size="0.01"/>
+        </body>
+      </body>
+
+      <!-- ================================================================= -->
+      <!-- UNIT #102: BIPOLAR STEPPER RIG (NEMA-17 Precision Dial)           -->
+      <!-- ================================================================= -->
+      <body name="unit_102_stepper_mount" pos="0.0 0 0.05">
+        <geom name="nema17_body" type="box" size="0.021 0.021 0.024" rgba="0.18 0.18 0.20 1"/>
+        <!-- 28x28mm Telekine Unit Stamp mounted on NEMA-17 backplate -->
+        <geom name="stepper_telekine_stamp" type="box" pos="0 0 -0.026" size="0.014 0.014 0.002" material="stamp_pcb"/>
+        <body name="unit_102_stepper_rotor" pos="0 0 0.03">
+          <joint name="joint_102_stepper" type="hinge" axis="0 0 1" range="-3600 3600" damping="0.15"/>
+          <geom name="stepper_pointer" type="box" pos="0.04 0 0" size="0.045 0.006 0.004" material="stepper_mat"/>
+        </body>
+      </body>
+
+      <!-- ================================================================= -->
+      <!-- UNIT #103: 24V BRUSHED DC GEARMOTOR + STALL OBSTACLE              -->
+      <!-- ================================================================= -->
+      <body name="unit_103_dc_mount" pos="0.35 0 0.08">
+        <geom name="dc_motor_can" type="cylinder" size="0.018 0.03" euler="90 0 0" rgba="0.3 0.3 0.35 1"/>
+        <geom name="dc_telekine_stamp" type="box" pos="0 0.035 0" size="0.014 0.002 0.014" material="stamp_pcb"/>
+        <!-- Removable Mechanical Hard-Stop Post at +110 deg for IPROPI Stall Demo -->
+        <geom name="mechanical_hard_stop" type="cylinder" pos="-0.04 0 0.09" size="0.006 0.02" rgba="0.9 0.1 0.1 1"/>
+        <body name="unit_103_dc_lever" pos="0 -0.035 0">
+          <joint name="joint_103_dc_motor" type="hinge" axis="0 1 0" range="-180 180" damping="0.08"/>
+          <geom name="dc_lever_arm" type="capsule" fromto="0 0 0 0.12 0 0" size="0.01" material="dc_mat"/>
+          <geom name="dc_payload_mass" type="sphere" pos="0.12 0 0" size="0.018" mass="0.25" material="dc_mat"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <!-- Maps to UniversalPinCommand::PwmPulseWidthUs (1000..2000 us -> -90..+90 deg) -->
+    <position name="act_101_servo" joint="joint_101_servo" kp="2.5" ctrlrange="-90 90"/>
+    <!-- Maps to UniversalPinCommand::StepperPulse (closed-loop step angle) -->
+    <position name="act_102_stepper" joint="joint_102_stepper" kp="5.0" ctrlrange="-3600 3600"/>
+    <!-- Maps to UniversalPinCommand::HBridgeDuty (-1.0..+1.0 normalized motor voltage/torque) -->
+    <motor name="act_103_dc_motor" joint="joint_103_dc_motor" gear="2.2" ctrlrange="-1.0 1.0"/>
+  </actuator>
+
+  <sensor>
+    <jointpos name="sens_servo_pos" joint="joint_101_servo"/>
+    <jointpos name="sens_stepper_pos" joint="joint_102_stepper"/>
+    <jointpos name="sens_dc_pos" joint="joint_103_dc_motor"/>
+    <actuatorfrc name="sens_dc_current_proxy" actuator="act_103_dc_motor"/>
+  </sensor>
+</mujoco>

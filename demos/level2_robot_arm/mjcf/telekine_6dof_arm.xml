@@ -1,0 +1,98 @@
+<mujoco model="telekine_level2_6dof_robot_arm">
+  <compiler angle="degree" coordinate="local" inertiafromgeom="true"/>
+  <option timestep="0.001" gravity="0 0 -9.81" integrator="RK4"/>
+
+  <default>
+    <joint armature="0.02" damping="0.25" limited="true"/>
+    <geom contype="1" conaffinity="1" friction="1.0 0.05 0.05"/>
+  </default>
+
+  <asset>
+    <texture name="grid" type="2d" builtin="checker" rgb1=".12 .15 .18" rgb2=".18 .22 .27" width="512" height="512"/>
+    <material name="grid_mat" texture="grid" texrepeat="10 10" reflectance="0.15"/>
+    <material name="arm_metal" rgba="0.22 0.25 0.30 1"/>
+    <material name="stepper_joint" rgba="0.20 0.85 0.45 1"/>
+    <material name="dc_joint" rgba="0.95 0.50 0.15 1"/>
+    <material name="servo_joint" rgba="0.15 0.65 0.95 1"/>
+    <material name="stamp_pcb" rgba="0.10 0.40 0.22 1"/>
+  </asset>
+
+  <worldbody>
+    <light directional="true" diffuse=".85 .85 .85" specular=".25 .25 .25" pos="0.5 -0.5 2.5" dir="-0.2 0.2 -1"/>
+    <geom name="floor" type="plane" size="2 2 0.05" material="grid_mat"/>
+
+    <!-- Workcell Table -->
+    <body name="workcell_table" pos="0 0 0.4">
+      <geom name="table_surface" type="box" size="0.5 0.5 0.02" rgba="0.28 0.30 0.33 1"/>
+      <!-- Pick Zone Marker (Green) & Place Zone Marker (Blue) -->
+      <site name="pick_zone" pos="0.28 0.00 0.022" size="0.035 0.035 0.002" type="box" rgba="0.1 0.8 0.3 0.4"/>
+      <site name="place_zone" pos="0.18 0.22 0.022" size="0.035 0.035 0.002" type="box" rgba="0.2 0.5 0.95 0.4"/>
+
+      <!-- ================================================================= -->
+      <!-- TELEKINE 6-DOF ROBOT ARM (#201..#206)                             -->
+      <!-- ================================================================= -->
+      <body name="arm_base_pedestal" pos="0 0 0.05">
+        <geom name="pedestal_geom" type="cylinder" size="0.06 0.03" material="arm_metal"/>
+
+        <!-- JOINT 1 (#201): Waist Yaw - NEMA-23 Bipolar Stepper -->
+        <body name="link1_waist" pos="0 0 0.05">
+          <joint name="j1_waist_stepper" type="hinge" axis="0 0 1" range="-180 180" damping="0.4"/>
+          <geom name="j1_housing" type="cylinder" size="0.045 0.035" material="stepper_joint"/>
+          <geom name="stamp_201" type="box" pos="-0.048 0 0" size="0.003 0.014 0.014" material="stamp_pcb"/>
+
+          <!-- JOINT 2 (#202): Shoulder Lift - 24V Brushed DC Gearmotor -->
+          <body name="link2_shoulder" pos="0 0 0.05">
+            <joint name="j2_shoulder_dc" type="hinge" axis="0 1 0" range="-90 90" damping="0.5"/>
+            <geom name="j2_housing" type="cylinder" size="0.038 0.03" euler="90 0 0" material="dc_joint"/>
+            <geom name="upper_arm_link" type="capsule" fromto="0 0 0 0 0 0.25" size="0.024" material="arm_metal"/>
+            <geom name="stamp_202" type="box" pos="0 0.034 0.05" size="0.014 0.003 0.014" material="stamp_pcb"/>
+
+            <!-- JOINT 3 (#203): Elbow Flex - 24V Brushed DC Gearmotor -->
+            <body name="link3_elbow" pos="0 0 0.25">
+              <joint name="j3_elbow_dc" type="hinge" axis="0 1 0" range="-135 135" damping="0.35"/>
+              <geom name="j3_housing" type="cylinder" size="0.032 0.026" euler="90 0 0" material="dc_joint"/>
+              <geom name="forearm_link" type="capsule" fromto="0 0 0 0.20 0 0" size="0.018" material="arm_metal"/>
+              <geom name="stamp_203" type="box" pos="0.05 0.025 0" size="0.014 0.003 0.014" material="stamp_pcb"/>
+
+              <!-- JOINT 4 (#204): Wrist Pitch - High-Torque PWM Servo -->
+              <body name="link4_wrist_pitch" pos="0.20 0 0">
+                <joint name="j4_wrist_pitch_servo" type="hinge" axis="0 1 0" range="-90 90" damping="0.1"/>
+                <geom name="j4_housing" type="box" size="0.02 0.018 0.018" material="servo_joint"/>
+                <geom name="stamp_204" type="box" pos="0 0 0.021" size="0.014 0.014 0.002" material="stamp_pcb"/>
+
+                <!-- JOINT 5 (#205): Wrist Roll - PWM Servo -->
+                <body name="link5_wrist_roll" pos="0.035 0 0">
+                  <joint name="j5_wrist_roll_servo" type="hinge" axis="1 0 0" range="-180 180" damping="0.05"/>
+                  <geom name="j5_housing" type="cylinder" size="0.016 0.015" euler="0 90 0" material="servo_joint"/>
+
+                  <!-- JOINT 6 (#206): Parallel Gripper Servo -->
+                  <body name="link6_gripper_base" pos="0.025 0 0">
+                    <joint name="j6_gripper_servo" type="hinge" axis="0 0 1" range="0 90" damping="0.05"/>
+                    <geom name="finger_left" type="box" pos="0.025 0.018 0" size="0.022 0.004 0.01" material="servo_joint"/>
+                    <geom name="finger_right" type="box" pos="0.025 -0.018 0" size="0.022 0.004 0.01" material="servo_joint"/>
+                    <site name="end_effector_tcp" pos="0.03 0 0" size="0.008" rgba="1 0.2 0.2 1"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+
+    <!-- Target Payload Cube to Pick & Place -->
+    <body name="target_cube" pos="0.28 0.00 0.445">
+      <freejoint name="cube_freejoint"/>
+      <geom name="cube_geom" type="box" size="0.02 0.02 0.02" mass="0.08" rgba="0.95 0.25 0.25 1"/>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <position name="act_201_waist_stepper" joint="j1_waist_stepper" kp="18.0" ctrlrange="-180 180"/>
+    <position name="act_202_shoulder_dc" joint="j2_shoulder_dc" kp="22.0" ctrlrange="-90 90"/>
+    <position name="act_203_elbow_dc" joint="j3_elbow_dc" kp="16.0" ctrlrange="-135 135"/>
+    <position name="act_204_wrist_pitch_servo" joint="j4_wrist_pitch_servo" kp="6.0" ctrlrange="-90 90"/>
+    <position name="act_205_wrist_roll_servo" joint="j5_wrist_roll_servo" kp="4.0" ctrlrange="-180 180"/>
+    <position name="act_206_gripper_servo" joint="j6_gripper_servo" kp="5.0" ctrlrange="0 90"/>
+  </actuator>
+</mujoco>

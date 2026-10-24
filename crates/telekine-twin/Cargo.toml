@@ -1,10 +1,12 @@
 [package]
 name = "telekine-twin"
+description = "MuJoCo Digital Twin & Sim-to-Real Shadow Execution Engine for Level 1 Foundational Units (Servo, Stepper, DC) and Level 2 6-DOF Robot Arm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-repository.workspace = true
-authors.workspace = true
 
 [dependencies]
 telekine-proto = { path = "../telekine-proto" }
+telekine-core = { path = "../telekine-core" }
+telekine-firmware = { path = "../telekine-firmware" }
+telekine-host = { path = "../telekine-host" }
