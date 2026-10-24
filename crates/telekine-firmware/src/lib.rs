@@ -124,6 +124,30 @@ pub trait Sx1262LoRaHal {
     fn poll_receive(&mut self) -> Option<EncryptedFrame>;
 }
 
+/// Hardware trait for Nordic nRF52/nRF53 series BLE (Bluetooth Low Energy) for ultra-fast local loops.
+pub trait NordicBleRadioHal {
+    /// Configures the BLE radio for connectionless advertising or scanning mode.
+    fn configure_ble(&mut self);
+
+    /// Transmit an encrypted frame using a BLE Advertising packet.
+    fn transmit_ble_frame(&mut self, frame: &EncryptedFrame) -> Result<(), ()>;
+
+    /// Poll for an incoming encrypted frame from the BLE receiver.
+    fn poll_receive_ble(&mut self) -> Option<EncryptedFrame>;
+}
+
+/// Hardware trait for STM32 series motor controllers running the 1kHz safety loop.
+pub trait Stm32MotorControlHal {
+    /// Initialize GPIOs and timers for PWM motor control.
+    fn init_pwm(&mut self);
+
+    /// Apply a bounded actuation effort (e.g., target torque or speed).
+    fn apply_effort(&mut self, effort_q16: i32, max_limit_pct: u8);
+
+    /// Trigger an immediate hardware E-Stop (lock brakes, drop torque to 0).
+    fn emergency_stop(&mut self);
+}
+
 /// **Dynamic Peer-Swapping Ring Buffer (`MAX_HW_PEERS = 16`)**
 ///
 /// ESP-NOW's hardware peer table only supports 20 total peers (and 17 encrypted).
