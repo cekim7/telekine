@@ -1,10 +1,10 @@
 # Telekine
 
-**All-Rust Wireless AI Control Stack for 1,000+ Low-Intelligence Actuators via Dual-Radio Redundancy (ESP-NOW + Raw LoRa)**
+**Rust Wireless Control Stack for Embedded Actuators via Dual-Radio Redundancy (ESP-NOW + LoRa)**
 
-Telekine enables an AI agent to deterministically and safely orchestrate swarms of **1,000+ low-intelligence wireless actuators** across **100+ hubs** using parallel physical-layer redundancy:
-- **ESP-NOW (2.4 GHz, ESP32-S3 / ESP32-C3):** Ultra-fast local control (`1–3 ms` latency, `100–250 m` range, WMM `AC_VO` priority queuing).
-- **Raw LoRa (915 MHz, Semtech SX1262):** Long-range, wall-penetrating backup (`30–80 ms` latency, `1–10+ km` range, `SF7` VIP interrupt frequency + Capture Effect power boost).
+Telekine is designed to help AI agents reliably and safely control distributed wireless actuators using parallel physical-layer redundancy, capable of scaling to large deployments:
+- **ESP-NOW (2.4 GHz):** Fast local control (`1–3 ms` latency, local range, priority queuing).
+- **LoRa (915 MHz):** Longer-range, reliable backup (`30–80 ms` latency, extended range).
 
 ---
 
@@ -12,12 +12,12 @@ Telekine enables an AI agent to deterministically and safely orchestrate swarms 
 
 | Pillar | Implementation in Telekine |
 | :--- | :--- |
-| **1. Dual-Radio Redundancy** | **Hot-Hot (Twin-Cast)** fires critical intents & E-Stops on ESP-NOW and LoRa simultaneously (`First-Valid-Wins`). **Hot-Warm (Auto-Failover)** fires on ESP-NOW first and triggers LoRa failover if hardware `ACK` misses the `3 ms` deadline. |
-| **2. 1,000+ Peer Scale & Coexistence** | Connectionless addressing via a 2-byte `target_id` (`up to 65,534 nodes` + broadcast `0xFFFF`), dynamic 20-slot ESP-NOW RAM peer-swapping, **Master Manager Channel** (Ch 1 / 915.0 MHz) + **Worker Channels** (Ch 6, 11), **TDMA millisecond time-slotting**, and **Triple-Burst Broadcasts** (`< 0.1%` packet loss). |
-| **3. Priority & Capture Effect** | Hardware 802.11 WMM/EDCA **`AC_VO` (Voice)** tagging for urgent ESP-NOW frames, dedicated **LoRa `SF7` VIP Emergency channel**, and dynamic TX power scaling (`+10 dBm` nominal for spatial reuse vs. `+22 to +30 dBm` emergency boost to trigger the **RF Capture Effect**). |
-| **4. 32-Byte Wire Protocol & Deduplication** | Zero-copy `#[repr(C, packed)]` 32-byte binary frame (`WirePacket`) with 4-byte monotonic `seq_nonce` (`if incoming_seq <= last_executed_seq { drop() }`) and `exec_at_tick_ms` for sub-millisecond **Sync-and-Fire** swarm coordination. |
-| **5. Physical Safety & Bounded Intents** | AI never sends raw open-loop ON/OFF toggles. Every command is a **Bounded Intent** (target goal + max speed % + max torque % + lease timeout) executed by a local **1 kHz hardware loop**, guarded by a **Dual-Link Dead-Man's Switch**, automatic **Limp Mode** when running LoRa-only, and **Report-by-Exception** uplink telemetry. |
-| **6. Fleet-Scale Hardware Security** | Application-layer **AES-128-GCM** encryption + 96-bit auth tag inside the 32-byte frame, anti-replay `seq_nonce` verification, and **per-device key derivation** (`KDF(MasterKey, DeviceMAC, TargetID)`) paired with ESP32 Flash Encryption & Secure Boot. |
+| **1. Dual-Radio Redundancy** | **Hot-Hot (Twin-Cast)** can send critical intents simultaneously. **Hot-Warm (Auto-Failover)** prioritizes ESP-NOW and falls back to LoRa if needed. |
+| **2. Peer Scale & Coexistence** | Connectionless addressing, dynamic ESP-NOW RAM peer-swapping, and scheduled time-slotting to coordinate multiple devices. |
+| **3. Priority Tagging** | Hardware 802.11 WMM/EDCA tagging for urgent frames, and a dedicated LoRa channel for important messages. |
+| **4. Compact Wire Protocol** | Zero-copy `#[repr(C, packed)]` 32-byte binary frame with monotonic sequencing and deduplication. |
+| **5. Physical Safety** | Uses **Bounded Intents** (target goal + max limits) instead of raw open-loop toggles. Incorporates local hardware loops and automatic safe states. |
+| **6. Security** | Application-layer **AES-128-GCM** encryption with per-device key derivation and anti-replay verification. |
 
 ---
 

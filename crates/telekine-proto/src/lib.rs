@@ -33,7 +33,8 @@ pub mod crypto;
 pub mod packet;
 
 pub use crypto::{
-    derive_device_key, Aes128GcmSoftware, CryptoEngine, DeviceSecurityContext, SecurityError,
+    derive_broadcast_key, derive_device_key, seal_with_key, Aes128GcmSoftware, CryptoEngine,
+    DeviceSecurityContext, SecurityError,
 };
 pub use packet::{
     BoundedIntent, EncryptedFrame, IntentOpcode, PacketFlags, Priority, RadioLink, RedundancyMode,
