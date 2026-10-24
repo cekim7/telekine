@@ -6,3 +6,5 @@ __pycache__/
 *.pyc
 *.whl
 .env
+/demos/
+/telekine_demos/
