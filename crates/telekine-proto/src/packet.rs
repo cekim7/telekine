@@ -1,13 +1,14 @@
-//! 32-Byte ultra-compact binary wire protocol and bounded AI intent structures.
+//! 32-Byte ultra-compact binary wire protocol, Foundational Unit Discovery & Access Lease,
+//! and Bounded AI Intent structures (`Servo`, `Stepper`, `DcMotor`).
 
-/// Fixed wire size of every Telekine command or telemetry packet (32 bytes).
+/// Fixed wire size of every Telekine command, discovery, or telemetry packet (32 bytes).
 /// Keeps ESP-NOW airtime < 1 ms and Raw LoRa SF7 airtime ~ 25 ms.
 pub const WIRE_PACKET_SIZE: usize = 32;
 
 /// Reserved target ID for fleet-wide broadcasts (all 1,000+ nodes).
 pub const BROADCAST_TARGET_ID: u16 = 0xFFFF;
 
-/// Reserved target ID for Master Manager Channel discovery & TDMA clock sync.
+/// Reserved target ID for Master Manager Channel discovery, access claims & TDMA clock sync.
 pub const MASTER_CHANNEL_TARGET_ID: u16 = 0xFFFE;
 
 /// Physical radio link over which a packet was transmitted or received.
@@ -17,6 +18,53 @@ pub enum RadioLink {
     EspNow24Ghz,
     /// 915 MHz Semtech SX1262 Raw LoRa link (30–80 ms latency, 1–10+ km range).
     RawLoRa915Mhz,
+}
+
+/// The three foundational hardware unit elements for Demo 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum UnitElementKind {
+    /// Unconfigured or generic actuator node.
+    Unknown = 0,
+    /// **RC / Industrial PWM Servo:** Bounded angle (`-90°..+90°` or `0°..180°`), 50–333 Hz pulse width.
+    Servo = 1,
+    /// **Bipolar Stepper Motor:** Bounded step/angle position or velocity via 2-coil H-bridge / Step-Dir.
+    Stepper = 2,
+    /// **Reversible Brushed DC Motor / Linear Actuator:** H-bridge PWM duty + stall-current & encoder feedback.
+    DcMotor = 3,
+}
+
+impl UnitElementKind {
+    pub const fn from_u8(val: u8) -> Self {
+        match val {
+            1 => Self::Servo,
+            2 => Self::Stepper,
+            3 => Self::DcMotor,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Access & reservation state advertised by a Foundational Unit during discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum UnitAccessState {
+    /// Listening on Master Manager Channel 1; available to be claimed by any AI Hub.
+    IdleAvailable = 0,
+    /// Currently leased to a specific AI Hub (`claimed_by_hub_id`); rejects other hubs until released or lease expires.
+    ClaimedByHub = 1,
+    /// Hardware fault / stall / E-Stop latched; requires inspection or reset.
+    Faulted = 2,
+}
+
+impl UnitAccessState {
+    pub const fn from_u8(val: u8) -> Self {
+        match val {
+            0 => Self::IdleAvailable,
+            1 => Self::ClaimedByHub,
+            _ => Self::Faulted,
+        }
+    }
 }
 
 /// Hardware wait-time (WMM / EDCA) and RF power / frequency priority level.
@@ -60,7 +108,7 @@ impl Priority {
             (Self::NormalBe, RadioLink::RawLoRa915Mhz) => 14,
             (Self::HighVi, RadioLink::RawLoRa915Mhz) => 18,
             (Self::CriticalVo, RadioLink::RawLoRa915Mhz) => 22,
-            (Self::VipEmergency, RadioLink::RawLoRa915Mhz) => 22, // SX1262 max (+30 dBm with PA)
+            (Self::VipEmergency, RadioLink::RawLoRa915Mhz) => 22,
         }
     }
 }
@@ -137,7 +185,7 @@ impl PacketFlags {
     }
 }
 
-/// Wire opcode defining the bounded intent or control operation.
+/// Wire opcode defining the bounded intent, discovery probe, access claim, or telemetry operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum IntentOpcode {
@@ -149,12 +197,25 @@ pub enum IntentOpcode {
     MoveToBounded = 0x02,
     /// Bounded velocity goal: maintain target velocity (Q16.16) for at most `lease_timeout_ms`.
     SetVelocityBounded = 0x03,
-    /// Bounded force/pressure/valve goal: regulate to target (Q16.16) with hardware lease.
+    /// Bounded force/pressure/duty goal: regulate to target (Q16.16) with hardware lease.
     SetActuationEffortBounded = 0x04,
     /// Master Manager Channel beacon: synchronizes swarm millisecond tick clock.
     SyncClockBeacon = 0x10,
     /// Master Manager Channel assignment: assigns worker channel (e.g. Ch 6/11) and TDMA slot.
     AssignChannelAndTdmaSlot = 0x11,
+    /// **Discovery Probe:** Broadcast by an AI Hub on Master Channel 1 to discover nearby
+    /// compatible `Servo`, `Stepper`, and `DcMotor` units.
+    DiscoverUnitsProbe = 0x20,
+    /// **Discovery Announce:** Sent by a unit in response to `DiscoverUnitsProbe` (or on boot),
+    /// advertising its `UnitElementKind` (`Servo`, `Stepper`, `DcMotor`), `UnitAccessState`,
+    /// currently owning `hub_id`, and travel range.
+    UnitDiscoveryAnnounce = 0x21,
+    /// **Claim Unit Access:** Sent by an AI Hub to gain exclusive control of a discovered unit
+    /// for `access_lease_ms` and assign its Worker Channel (`6` or `11`) and TDMA slot.
+    ClaimUnitAccess = 0x22,
+    /// **Release Unit Access:** Sent by an AI Hub when done controlling a unit so it returns to
+    /// safe idle on Master Channel 1 and becomes available for other tasks/hubs.
+    ReleaseUnitAccess = 0x23,
     /// Report-by-Exception uplink packet sent by an actuator only on stall/fault/deviation.
     TelemetryExceptionReport = 0xFE,
 }
@@ -169,6 +230,10 @@ impl IntentOpcode {
             0x04 => Some(Self::SetActuationEffortBounded),
             0x10 => Some(Self::SyncClockBeacon),
             0x11 => Some(Self::AssignChannelAndTdmaSlot),
+            0x20 => Some(Self::DiscoverUnitsProbe),
+            0x21 => Some(Self::UnitDiscoveryAnnounce),
+            0x22 => Some(Self::ClaimUnitAccess),
+            0x23 => Some(Self::ReleaseUnitAccess),
             0xFE => Some(Self::TelemetryExceptionReport),
             _ => None,
         }
@@ -186,6 +251,7 @@ pub enum TelemetryExceptionCode {
     WatchdogLeaseExpiredFailsafe = 4,
     EnteredLoRaLimpMode = 5,
     CryptoAuthFailureDetected = 6,
+    UnauthorizedHubAccessRejected = 7,
 }
 
 impl TelemetryExceptionCode {
@@ -197,40 +263,34 @@ impl TelemetryExceptionCode {
             4 => Self::WatchdogLeaseExpiredFailsafe,
             5 => Self::EnteredLoRaLimpMode,
             6 => Self::CryptoAuthFailureDetected,
+            7 => Self::UnauthorizedHubAccessRejected,
             _ => Self::None,
         }
     }
 }
 
-/// High-level **Bounded Intent** emitted by the AI Agent.
-///
-/// The AI never sends raw open-loop toggles ("Turn Motor ON"). Every physical
-/// command carries explicit speed/torque bounds and a watchdog lease timeout.
+/// High-level **Bounded Intent** or **Discovery/Access Operation** emitted by the AI Agent or Unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoundedIntent {
     /// Immediate E-Stop (0% torque, brakes locked, valves shut).
     EmergencyStop,
     /// Renew the Dual-Link Dead-Man's Switch lease without altering the goal.
     WatchdogHeartbeat { lease_timeout_ms: u16 },
-    /// Move to a bounded target position (in fixed-point Q16.16 degrees or mm).
+    /// Move a `Servo`, `Stepper`, or closed-loop `DcMotor` to a bounded target position (Q16.16 degrees/steps/mm).
     MoveToBounded {
-        /// Target position in Q16.16 fixed-point (e.g., `45.0 * 65536.0`).
         target_pos_q16: i32,
-        /// Maximum speed percentage (`1..=100`).
         max_speed_pct: u8,
-        /// Maximum torque percentage (`1..=100`).
         max_torque_pct: u8,
-        /// Hardware watchdog lease duration in milliseconds (`250..=1000` typical).
         lease_timeout_ms: u16,
     },
-    /// Maintain a bounded target velocity for at most `lease_timeout_ms`.
+    /// Maintain a bounded target velocity on a `Stepper` or `DcMotor` for at most `lease_timeout_ms`.
     SetVelocityBounded {
         target_vel_q16: i32,
         max_accel_pct: u8,
         max_torque_pct: u8,
         lease_timeout_ms: u16,
     },
-    /// Regulate force/valve/effort to a bounded setpoint with hardware lease.
+    /// Regulate effort/duty on a `DcMotor` or `Servo` with a hardware lease.
     SetActuationEffortBounded {
         target_effort_q16: i32,
         max_rate_pct: u8,
@@ -249,6 +309,29 @@ pub enum BoundedIntent {
         tdma_slot_index: u16,
         tdma_frame_slots: u16,
     },
+    /// **AI Hub Discovery Probe:** Asks all compatible units (`or filter_kind`) to announce themselves.
+    DiscoverUnitsProbe {
+        hub_id: u8,
+        filter_kind: UnitElementKind,
+    },
+    /// **Unit Discovery Announce:** Sent by a `Servo`, `Stepper`, or `DcMotor` unit advertising
+    /// its hardware type, current access state, owning Hub ID, and symmetric travel limit in Q16.16.
+    UnitDiscoveryAnnounce {
+        element_kind: UnitElementKind,
+        access_state: UnitAccessState,
+        claimed_by_hub_id: u8,
+        max_travel_q16: i32,
+    },
+    /// **Claim Unit Access:** AI Hub claims exclusive control of a unit for `access_lease_ms`
+    /// and assigns its operating worker channel.
+    ClaimUnitAccess {
+        hub_id: u8,
+        espnow_worker_channel: u8,
+        tdma_slot_index: u16,
+        access_lease_ms: u16,
+    },
+    /// **Release Unit Access:** AI Hub releases a unit back to `IdleAvailable` on Master Channel 1.
+    ReleaseUnitAccess { hub_id: u8 },
     /// Report-by-exception uplink alert from an actuator back to the Hub.
     TelemetryExceptionReport {
         exception: TelemetryExceptionCode,
@@ -258,7 +341,7 @@ pub enum BoundedIntent {
 }
 
 impl BoundedIntent {
-    /// Helper to construct a `MoveToBounded` intent from floating-point degrees.
+    /// Helper to construct a `MoveToBounded` intent from floating-point degrees or steps.
     pub fn move_to_deg(
         angle_deg: f32,
         max_speed_pct: u8,
@@ -347,6 +430,47 @@ impl BoundedIntent {
                     chan_packed,
                 )
             }
+            Self::DiscoverUnitsProbe {
+                hub_id,
+                filter_kind,
+            } => {
+                let packed = ((hub_id as u16) << 8) | (filter_kind as u16);
+                (IntentOpcode::DiscoverUnitsProbe, 0, 0, packed)
+            }
+            Self::UnitDiscoveryAnnounce {
+                element_kind,
+                access_state,
+                claimed_by_hub_id,
+                max_travel_q16,
+            } => {
+                let meta = ((element_kind as u16) << 8) | (access_state as u16);
+                (
+                    IntentOpcode::UnitDiscoveryAnnounce,
+                    claimed_by_hub_id as u16,
+                    max_travel_q16,
+                    meta,
+                )
+            }
+            Self::ClaimUnitAccess {
+                hub_id,
+                espnow_worker_channel,
+                tdma_slot_index,
+                access_lease_ms,
+            } => {
+                let meta = ((hub_id as u16) << 8) | (espnow_worker_channel as u16);
+                (
+                    IntentOpcode::ClaimUnitAccess,
+                    access_lease_ms,
+                    tdma_slot_index as i32,
+                    meta,
+                )
+            }
+            Self::ReleaseUnitAccess { hub_id } => (
+                IntentOpcode::ReleaseUnitAccess,
+                0,
+                0,
+                (hub_id as u16) << 8,
+            ),
             Self::TelemetryExceptionReport {
                 exception,
                 measured_pos_q16,
@@ -403,6 +527,23 @@ impl BoundedIntent {
                 tdma_slot_index: param_primary_q16 as u16,
                 tdma_frame_slots: lease_timeout_ms,
             },
+            IntentOpcode::DiscoverUnitsProbe => Self::DiscoverUnitsProbe {
+                hub_id: hi,
+                filter_kind: UnitElementKind::from_u8(lo),
+            },
+            IntentOpcode::UnitDiscoveryAnnounce => Self::UnitDiscoveryAnnounce {
+                element_kind: UnitElementKind::from_u8(hi),
+                access_state: UnitAccessState::from_u8(lo),
+                claimed_by_hub_id: (lease_timeout_ms & 0xFF) as u8,
+                max_travel_q16: param_primary_q16,
+            },
+            IntentOpcode::ClaimUnitAccess => Self::ClaimUnitAccess {
+                hub_id: hi,
+                espnow_worker_channel: lo,
+                tdma_slot_index: param_primary_q16 as u16,
+                access_lease_ms: lease_timeout_ms,
+            },
+            IntentOpcode::ReleaseUnitAccess => Self::ReleaseUnitAccess { hub_id: hi },
             IntentOpcode::TelemetryExceptionReport => Self::TelemetryExceptionReport {
                 exception: TelemetryExceptionCode::from_u8(hi),
                 measured_pos_q16: param_primary_q16,
@@ -423,7 +564,7 @@ pub struct WirePacket {
     pub flags: PacketFlags,
     /// Scheduled execution tick in milliseconds (`0` = execute immediately on arrival).
     pub exec_at_tick_ms: u32,
-    /// Decoded bounded AI intent.
+    /// Decoded bounded AI intent or discovery/access message.
     pub intent: BoundedIntent,
 }
 
@@ -492,10 +633,6 @@ impl WirePacket {
 }
 
 /// Raw 32-byte encrypted wire frame transmitted over ESP-NOW or Semtech SX1262 LoRa.
-///
-/// Because `EncryptedFrame` does not expose `.intent`, the compiler enforces that
-/// an actuator cannot execute a frame without passing it through `DeviceSecurityContext`
-/// and the monotonic `seq_nonce` deduplicator first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct EncryptedFrame(pub [u8; WIRE_PACKET_SIZE]);
@@ -523,7 +660,7 @@ impl EncryptedFrame {
 }
 
 /// Typestate-verified command produced ONLY after:
-/// 1. Target ID match (`target_id == node_id` or `BROADCAST_TARGET_ID`)
+/// 1. Target ID match (`target_id == node_id` or `BROADCAST_TARGET_ID` or `MASTER_CHANNEL_TARGET_ID`)
 /// 2. Monotonic sequence check (`incoming_seq > last_executed_seq`)
 /// 3. AES-128-GCM 96-bit authentication tag verification & payload decryption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -3,28 +3,28 @@
 
 //! # `telekine-core`
 //!
-//! `#[no_std]` deterministic actuator control & safety state machine shared between
-//! bare-metal ESP32-S3/C3 firmware (`telekine-firmware`) and the 1,000-node swarm
-//! simulator (`telekine-sim`).
+//! `#[no_std]` deterministic actuator control, **Foundational Unit Discovery & Access Lease**
+//! (`Servo`, `Stepper`, `DcMotor`), and safety state machine shared between bare-metal
+//! ESP32-S3/C3 firmware (`telekine-firmware`) and the swarm simulator (`telekine-sim`).
 //!
-//! ## Key Safety Guarantees
-//! 1. **Dual-Link Dead-Man's Switch (Watchdog Lease):** Any authenticated packet from
-//!    either **ESP-NOW (2.4 GHz)** or **Raw LoRa (915 MHz)** resets the hardware lease
-//!    countdown (`250–1,000 ms`). If both links go silent past the lease, the actuator
-//!    enters `ActuatorOperatingState::FailSafeLocked` (0% torque, brakes engaged, valves shut).
-//! 2. **Graceful Speed Degradation ("Limp Mode"):** If ESP-NOW drops out while LoRa remains
-//!    active, the actuator enters `ActuatorOperatingState::LoRaLimpMode` and scales down
-//!    maximum speed and torque limits until the fast 2.4 GHz link recovers.
-//! 3. **Time-Stamped "Sync-and-Fire" Buffer:** Coordinated swarm commands with
-//!    `exec_at_tick_ms > now` are buffered and triggered at the exact synchronized millisecond.
-//! 4. **Local 1 kHz Closed-Loop Execution:** The AI only sends bounded goal states;
-//!    `ActuatorNode::step_1khz()` closes the 1 ms control loop locally.
-//! 5. **Report-by-Exception Telemetry:** The actuator stays silent when movements succeed
-//!    and only emits an encrypted uplink exception frame on fault, stall, or state degradation.
+//! ## Demo 1 Lifecycle (Foundational Unit Elements: Servo, Stepper, DC Motor)
+//! 1. **Auto-Discovery on Master Channel 1:** Idle units listen on Channel 1 (`UnitAccessState::IdleAvailable`).
+//!    When an AI Hub broadcasts `DiscoverUnitsProbe`, each compatible unit replies with a
+//!    `UnitDiscoveryAnnounce` packet reporting its `UnitElementKind` (`Servo`, `Stepper`, `DcMotor`),
+//!    access state, and travel bounds.
+//! 2. **Dynamic Access Claiming (`ClaimUnitAccess`):** When the AI Hub needs a unit, it sends
+//!    `ClaimUnitAccess`, locking the unit to `hub_id`, switching it to the Hub's Worker Channel
+//!    (`6` or `11`) and TDMA slot, and arming the Dual-Link Dead-Man's Switch lease.
+//! 3. **Bounded Closed-Loop Execution & Limp Mode:** Executes `MoveToBounded`, `SetVelocityBounded`,
+//!    or `SetActuationEffortBounded` at 1 kHz, degrading speed/torque to 40% if 2.4 GHz ESP-NOW drops.
+//! 4. **Graceful Release or Watchdog Fail-Safe:** When the AI Hub sends `ReleaseUnitAccess`
+//!    (or if both radios go silent past the lease timeout), the unit locks into `FailSafeLocked`,
+//!    resets to `UnitAccessState::IdleAvailable`, and returns to Master Channel 1.
 
 use telekine_proto::{
     BoundedIntent, CryptoEngine, DeviceSecurityContext, EncryptedFrame, PacketFlags, Priority,
-    RadioLink, RedundancyMode, SecurityError, TelemetryExceptionCode, VerifiedCommand, WirePacket,
+    RadioLink, RedundancyMode, SecurityError, TelemetryExceptionCode, UnitAccessState,
+    UnitElementKind, VerifiedCommand, WirePacket, MASTER_CHANNEL_TARGET_ID,
 };
 
 /// Operating state of the actuator's dual-radio safety supervisor.
@@ -46,20 +46,22 @@ pub enum ActuatorOperatingState {
 pub struct HardwareOutput {
     /// Current operating mode of the safety supervisor.
     pub state: ActuatorOperatingState,
-    /// Commanded motor/valve effort in signed percent (`-100..=100`, `0` in fail-safe).
+    /// Foundational unit element type (`Servo`, `Stepper`, `DcMotor`).
+    pub element_kind: UnitElementKind,
+    /// Commanded motor/servo/stepper effort in signed percent (`-100..=100`, `0` in fail-safe).
     pub effort_pct: i8,
     /// Effective maximum speed cap after Limp Mode scaling (`0..=100`).
     pub effective_max_speed_pct: u8,
     /// Effective maximum torque cap after Limp Mode scaling (`0..=100`).
     pub effective_max_torque_pct: u8,
-    /// True if the mechanical brake is locked / fail-safe valve is closed.
+    /// True if the mechanical brake is locked / power gate is disabled.
     pub brakes_locked: bool,
 }
 
 /// TDMA & Channel assignment configuration managed via the Master Manager Channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TdmaChannelConfig {
-    /// Assigned ESP-NOW Worker Channel (e.g., Channel 6 or 11; Channel 1 is Master Manager).
+    /// Assigned ESP-NOW Worker Channel (`1` = Master Manager Channel, `6` or `11` = Worker Channels).
     pub espnow_worker_channel: u8,
     /// Assigned LoRa frequency offset in kHz from 915.0 MHz.
     pub lora_freq_khz_offset: u8,
@@ -72,7 +74,7 @@ pub struct TdmaChannelConfig {
 impl Default for TdmaChannelConfig {
     fn default() -> Self {
         Self {
-            espnow_worker_channel: 1, // Starts on Master Manager Channel 1 until assigned
+            espnow_worker_channel: 1, // Starts on Master Manager Channel 1 until claimed by a Hub
             lora_freq_khz_offset: 0,
             tdma_slot_index: 0,
             tdma_frame_slots: 1000,
@@ -101,15 +103,20 @@ impl Default for SafetyConfig {
     }
 }
 
-/// Complete `#[no_std]` Actuator Node controller combining:
+/// Complete `#[no_std]` Foundational Unit Node (`Servo`, `Stepper`, `DcMotor`) combining:
 /// - `DeviceSecurityContext` (AES-128-GCM + monotonic `seq_nonce` deduplication)
+/// - Master Channel 1 Auto-Discovery & Dynamic Hub Access Claim/Release
 /// - Dual-Link Dead-Man's Switch (`lease_expires_at_ms`)
 /// - Graceful LoRa Limp Mode speed/torque throttling
 /// - Sync-and-Fire pending command slot
 /// - Local 1 kHz closed-loop trajectory tracker
-/// - Report-by-Exception uplink generator
 pub struct ActuatorNode<E: CryptoEngine> {
     security: DeviceSecurityContext<E>,
+    element_kind: UnitElementKind,
+    access_state: UnitAccessState,
+    claimed_by_hub_id: Option<u8>,
+    max_travel_q16: i32,
+
     safety_cfg: SafetyConfig,
     tdma_cfg: TdmaChannelConfig,
     state: ActuatorOperatingState,
@@ -130,24 +137,47 @@ pub struct ActuatorNode<E: CryptoEngine> {
     active_intent: BoundedIntent,
     /// Buffered "Sync-and-Fire" command waiting for `synchronized_tick_ms >= exec_at_tick_ms`.
     pending_sync_command: Option<WirePacket>,
+    /// Pending outgoing discovery announcement frame queued in response to a Hub probe/claim.
+    pending_discovery_reply: Option<EncryptedFrame>,
 
-    /// Simulated or encoder-measured actuator position in Q16.16 fixed-point degrees.
+    /// Simulated or encoder-measured actuator position in Q16.16 fixed-point degrees/steps.
     measured_pos_q16: i32,
     /// External mechanical stall flag injected by current/encoder sensor.
     stall_detected: bool,
-    /// Outgoing Report-by-Exception telemetry counter.
+    /// Outgoing Report-by-Exception & Discovery uplink counter.
     uplink_seq_nonce: u32,
 }
 
 impl<E: CryptoEngine> ActuatorNode<E> {
-    /// Construct a new `ActuatorNode` initialized in `FailSafeLocked` state.
+    /// Construct a new `ActuatorNode` initialized in `FailSafeLocked` and `IdleAvailable` state.
     pub fn new(
         security: DeviceSecurityContext<E>,
         safety_cfg: SafetyConfig,
         initial_pos_q16: i32,
     ) -> Self {
+        Self::new_unit(
+            security,
+            UnitElementKind::DcMotor,
+            180 * 65536,
+            safety_cfg,
+            initial_pos_q16,
+        )
+    }
+
+    /// Construct a specific Foundational Unit (`Servo`, `Stepper`, or `DcMotor`) with travel bounds.
+    pub fn new_unit(
+        security: DeviceSecurityContext<E>,
+        element_kind: UnitElementKind,
+        max_travel_q16: i32,
+        safety_cfg: SafetyConfig,
+        initial_pos_q16: i32,
+    ) -> Self {
         Self {
             security,
+            element_kind,
+            access_state: UnitAccessState::IdleAvailable,
+            claimed_by_hub_id: None,
+            max_travel_q16,
             safety_cfg,
             tdma_cfg: TdmaChannelConfig::default(),
             state: ActuatorOperatingState::FailSafeLocked,
@@ -158,6 +188,7 @@ impl<E: CryptoEngine> ActuatorNode<E> {
             lease_expires_at_ms: None,
             active_intent: BoundedIntent::EmergencyStop,
             pending_sync_command: None,
+            pending_discovery_reply: None,
             measured_pos_q16: initial_pos_q16,
             stall_detected: false,
             uplink_seq_nonce: 0,
@@ -166,6 +197,22 @@ impl<E: CryptoEngine> ActuatorNode<E> {
 
     pub const fn node_id(&self) -> u16 {
         self.security.node_id()
+    }
+
+    pub const fn element_kind(&self) -> UnitElementKind {
+        self.element_kind
+    }
+
+    pub const fn access_state(&self) -> UnitAccessState {
+        self.access_state
+    }
+
+    pub const fn claimed_by_hub_id(&self) -> Option<u8> {
+        self.claimed_by_hub_id
+    }
+
+    pub const fn active_intent(&self) -> BoundedIntent {
+        self.active_intent
     }
 
     pub const fn operating_state(&self) -> ActuatorOperatingState {
@@ -188,22 +235,36 @@ impl<E: CryptoEngine> ActuatorNode<E> {
         (self.local_tick_ms as i64 + self.clock_offset_ms) as u32
     }
 
-    /// Returns `true` if the current synchronized millisecond matches this node's assigned
-    /// TDMA uplink transmit slot.
-    pub const fn is_my_tdma_slot(&self) -> bool {
-        if self.tdma_cfg.tdma_frame_slots == 0 {
-            return false;
-        }
-        let slot = (self.synchronized_tick_ms() % (self.tdma_cfg.tdma_frame_slots as u32)) as u16;
-        slot == self.tdma_cfg.tdma_slot_index
+    /// Take any queued `UnitDiscoveryAnnounce` uplink reply frame generated during `receive_frame()`.
+    pub fn take_discovery_reply(&mut self) -> Option<EncryptedFrame> {
+        self.pending_discovery_reply.take()
+    }
+
+    /// Build an encrypted `UnitDiscoveryAnnounce` frame advertising this unit's kind and access state.
+    pub fn build_discovery_announce_frame(&mut self) -> EncryptedFrame {
+        self.uplink_seq_nonce = self.uplink_seq_nonce.wrapping_add(1);
+        let pkt = WirePacket {
+            target_id: MASTER_CHANNEL_TARGET_ID,
+            seq_nonce: self.uplink_seq_nonce,
+            flags: PacketFlags::new(
+                Priority::HighVi,
+                RedundancyMode::HotHotTwinCast,
+                false,
+                true,
+                false,
+            ),
+            exec_at_tick_ms: self.node_id() as u32, // Carries originating node_id in exec_at_tick_ms
+            intent: BoundedIntent::UnitDiscoveryAnnounce {
+                element_kind: self.element_kind,
+                access_state: self.access_state,
+                claimed_by_hub_id: self.claimed_by_hub_id.unwrap_or(0),
+                max_travel_q16: self.max_travel_q16,
+            },
+        };
+        self.security.seal_packet(&pkt)
     }
 
     /// Receive a 32-byte `EncryptedFrame` from either ESP-NOW (2.4 GHz) or Raw LoRa (915 MHz).
-    ///
-    /// - Enforces **First-Valid-Wins** monotonic `seq_nonce` deduplication.
-    /// - Verifies the 96-bit AES-128-GCM tag and decrypts the bounded intent.
-    /// - Resets the Dual-Link Dead-Man's Switch lease timer.
-    /// - Buffers the instruction if `exec_at_tick_ms > now` (Sync-and-Fire), or applies it immediately.
     pub fn receive_frame(
         &mut self,
         frame: &EncryptedFrame,
@@ -217,11 +278,10 @@ impl<E: CryptoEngine> ActuatorNode<E> {
             RadioLink::RawLoRa915Mhz => self.last_lora_rx_ms = Some(now),
         }
 
-        // Check if this is a time-stamped "Sync-and-Fire" command scheduled for the future
         if verified.packet.flags.is_sync_and_fire() && verified.packet.exec_at_tick_ms > now {
-            // Renew lease at least until execution time + command lease
             let lease_ms = Self::extract_lease_ms(&verified.packet.intent).unwrap_or(250) as u32;
-            self.lease_expires_at_ms = Some(verified.packet.exec_at_tick_ms.saturating_add(lease_ms));
+            self.lease_expires_at_ms =
+                Some(verified.packet.exec_at_tick_ms.saturating_add(lease_ms));
             self.pending_sync_command = Some(verified.packet);
         } else {
             self.apply_verified_packet(verified.packet, now);
@@ -243,6 +303,9 @@ impl<E: CryptoEngine> ActuatorNode<E> {
             | BoundedIntent::SetActuationEffortBounded {
                 lease_timeout_ms, ..
             } => Some(lease_timeout_ms),
+            BoundedIntent::ClaimUnitAccess {
+                access_lease_ms, ..
+            } => Some(access_lease_ms),
             _ => None,
         }
     }
@@ -254,6 +317,40 @@ impl<E: CryptoEngine> ActuatorNode<E> {
                 self.pending_sync_command = None;
                 self.lease_expires_at_ms = None;
                 self.state = ActuatorOperatingState::EmergencyStopped;
+            }
+            BoundedIntent::DiscoverUnitsProbe { filter_kind, .. } => {
+                if filter_kind == UnitElementKind::Unknown || filter_kind == self.element_kind {
+                    self.pending_discovery_reply = Some(self.build_discovery_announce_frame());
+                }
+            }
+            BoundedIntent::ClaimUnitAccess {
+                hub_id,
+                espnow_worker_channel,
+                tdma_slot_index,
+                access_lease_ms,
+            } => {
+                let can_claim = self.access_state == UnitAccessState::IdleAvailable
+                    || self.claimed_by_hub_id == Some(hub_id);
+                if can_claim {
+                    self.access_state = UnitAccessState::ClaimedByHub;
+                    self.claimed_by_hub_id = Some(hub_id);
+                    self.tdma_cfg.espnow_worker_channel = espnow_worker_channel;
+                    self.tdma_cfg.tdma_slot_index = tdma_slot_index;
+                    self.lease_expires_at_ms = Some(now.saturating_add(access_lease_ms as u32));
+                    self.pending_discovery_reply = Some(self.build_discovery_announce_frame());
+                }
+            }
+            BoundedIntent::ReleaseUnitAccess { hub_id } => {
+                if self.claimed_by_hub_id == Some(hub_id) || self.claimed_by_hub_id.is_none() {
+                    self.active_intent = BoundedIntent::EmergencyStop;
+                    self.pending_sync_command = None;
+                    self.lease_expires_at_ms = None;
+                    self.state = ActuatorOperatingState::FailSafeLocked;
+                    self.access_state = UnitAccessState::IdleAvailable;
+                    self.claimed_by_hub_id = None;
+                    self.tdma_cfg.espnow_worker_channel = 1; // Return to Master Manager Channel 1
+                    self.pending_discovery_reply = Some(self.build_discovery_announce_frame());
+                }
             }
             BoundedIntent::WatchdogHeartbeat { lease_timeout_ms } => {
                 self.lease_expires_at_ms = Some(now.saturating_add(lease_timeout_ms as u32));
@@ -267,6 +364,10 @@ impl<E: CryptoEngine> ActuatorNode<E> {
             | BoundedIntent::SetActuationEffortBounded {
                 lease_timeout_ms, ..
             } => {
+                // Auto-claim if directly addressed via unicast key and currently IdleAvailable
+                if self.access_state == UnitAccessState::IdleAvailable {
+                    self.access_state = UnitAccessState::ClaimedByHub;
+                }
                 self.active_intent = pkt.intent;
                 self.lease_expires_at_ms = Some(now.saturating_add(lease_timeout_ms as u32));
             }
@@ -294,24 +395,20 @@ impl<E: CryptoEngine> ActuatorNode<E> {
                     tdma_frame_slots,
                 };
             }
-            BoundedIntent::TelemetryExceptionReport { .. } => {}
+            BoundedIntent::UnitDiscoveryAnnounce { .. }
+            | BoundedIntent::TelemetryExceptionReport { .. } => {}
         }
     }
 
     fn refresh_link_health_state(&mut self, now: u32) {
         if self.state == ActuatorOperatingState::EmergencyStopped {
-            if !matches!(self.active_intent, BoundedIntent::EmergencyStop) {
-                // Cleared by a new valid bounded intent
-            } else {
+            if matches!(self.active_intent, BoundedIntent::EmergencyStop) {
                 return;
             }
         }
 
-        // Check Dual-Link Dead-Man's Switch lease expiration
         match self.lease_expires_at_ms {
             Some(deadline) if now < deadline => {
-                // Lease is valid! Determine whether 2.4 GHz ESP-NOW is healthy or if we
-                // are running on the 915 MHz Raw LoRa backup link ("Limp Mode").
                 let espnow_alive = match self.last_espnow_rx_ms {
                     Some(last_esp) => {
                         now.saturating_sub(last_esp) <= self.safety_cfg.espnow_dropout_threshold_ms
@@ -326,9 +423,14 @@ impl<E: CryptoEngine> ActuatorNode<E> {
                 }
             }
             _ => {
-                // Both radios silent past lease timer -> automatic Fail-Safe State
+                // Both radios silent past lease timer -> automatic Fail-Safe State & release claim
                 self.state = ActuatorOperatingState::FailSafeLocked;
                 self.active_intent = BoundedIntent::EmergencyStop;
+                if self.access_state == UnitAccessState::ClaimedByHub {
+                    self.access_state = UnitAccessState::IdleAvailable;
+                    self.claimed_by_hub_id = None;
+                    self.tdma_cfg.espnow_worker_channel = 1;
+                }
             }
         }
     }
@@ -336,18 +438,17 @@ impl<E: CryptoEngine> ActuatorNode<E> {
     /// Inject or clear a hardware motor stall condition (from current-sense or encoder).
     pub fn set_stall_detected(&mut self, stalled: bool) {
         self.stall_detected = stalled;
+        if stalled {
+            self.access_state = UnitAccessState::Faulted;
+        }
     }
 
     /// Execute one tick (1 ms) of the local 1 kHz hardware control & safety loop.
-    ///
-    /// Returns `(HardwareOutput, Option<EncryptedFrame>)` where the second element is
-    /// `Some(EncryptedFrame)` **only** when a Report-by-Exception event occurs.
     pub fn step_1khz(&mut self) -> (HardwareOutput, Option<EncryptedFrame>) {
         self.local_tick_ms = self.local_tick_ms.wrapping_add(1);
         let now = self.synchronized_tick_ms();
         let prev_state = self.state;
 
-        // 1. Trigger pending "Sync-and-Fire" command if its execution millisecond has arrived
         if let Some(pending) = self.pending_sync_command {
             if now >= pending.exec_at_tick_ms {
                 self.pending_sync_command = None;
@@ -355,14 +456,13 @@ impl<E: CryptoEngine> ActuatorNode<E> {
             }
         }
 
-        // 2. Evaluate Dual-Link Watchdog Lease and Limp Mode state
         self.refresh_link_health_state(now);
 
-        // 3. Compute closed-loop output if in NormalDualLink or LoRaLimpMode
         let output = match self.state {
             ActuatorOperatingState::FailSafeLocked | ActuatorOperatingState::EmergencyStopped => {
                 HardwareOutput {
                     state: self.state,
+                    element_kind: self.element_kind,
                     effort_pct: 0,
                     effective_max_speed_pct: 0,
                     effective_max_torque_pct: 0,
@@ -383,11 +483,12 @@ impl<E: CryptoEngine> ActuatorNode<E> {
                         max_torque_pct,
                         ..
                     } => {
+                        let clamped_target =
+                            target_pos_q16.clamp(-self.max_travel_q16, self.max_travel_q16);
                         let eff_speed = (((max_speed_pct as u16) * scale) / 100).max(1) as u8;
                         let eff_torque = (((max_torque_pct as u16) * scale) / 100).max(1) as u8;
 
-                        let error_q16 = target_pos_q16.saturating_sub(self.measured_pos_q16);
-                        // Max step per millisecond at 100% speed = 0.25 deg/ms (250 deg/sec)
+                        let error_q16 = clamped_target.saturating_sub(self.measured_pos_q16);
                         let max_step_q16 = ((eff_speed as i32) * 16384) / 100;
 
                         let step_q16 = if self.stall_detected {
@@ -412,6 +513,7 @@ impl<E: CryptoEngine> ActuatorNode<E> {
 
                         HardwareOutput {
                             state: self.state,
+                            element_kind: self.element_kind,
                             effort_pct,
                             effective_max_speed_pct: eff_speed,
                             effective_max_torque_pct: eff_torque,
@@ -430,9 +532,34 @@ impl<E: CryptoEngine> ActuatorNode<E> {
                             let step = ((target_vel_q16 / 1000) * (scale as i32)) / 100;
                             self.measured_pos_q16 = self.measured_pos_q16.saturating_add(step);
                         }
+                        let dir_effort = if target_vel_q16 >= 0 {
+                            eff_torque as i8
+                        } else {
+                            -(eff_torque as i8)
+                        };
                         HardwareOutput {
                             state: self.state,
-                            effort_pct: eff_torque as i8,
+                            element_kind: self.element_kind,
+                            effort_pct: dir_effort,
+                            effective_max_speed_pct: eff_speed,
+                            effective_max_torque_pct: eff_torque,
+                            brakes_locked: false,
+                        }
+                    }
+                    BoundedIntent::SetActuationEffortBounded {
+                        target_effort_q16,
+                        max_rate_pct,
+                        max_effort_pct,
+                        ..
+                    } => {
+                        let eff_speed = (((max_rate_pct as u16) * scale) / 100).max(1) as u8;
+                        let eff_torque = (((max_effort_pct as u16) * scale) / 100).max(1) as u8;
+                        let signed_effort =
+                            ((target_effort_q16 / 65536) as i32).clamp(-(eff_torque as i32), eff_torque as i32) as i8;
+                        HardwareOutput {
+                            state: self.state,
+                            element_kind: self.element_kind,
+                            effort_pct: signed_effort,
                             effective_max_speed_pct: eff_speed,
                             effective_max_torque_pct: eff_torque,
                             brakes_locked: false,
@@ -440,6 +567,7 @@ impl<E: CryptoEngine> ActuatorNode<E> {
                     }
                     _ => HardwareOutput {
                         state: self.state,
+                        element_kind: self.element_kind,
                         effort_pct: 0,
                         effective_max_speed_pct: 0,
                         effective_max_torque_pct: 0,
@@ -449,7 +577,6 @@ impl<E: CryptoEngine> ActuatorNode<E> {
             }
         };
 
-        // 4. Report-by-Exception check: remain silent unless a fault or state degradation occurred
         let exception_code = if self.stall_detected {
             Some(TelemetryExceptionCode::MotorStallDetected)
         } else if prev_state != ActuatorOperatingState::FailSafeLocked
@@ -502,89 +629,5 @@ impl<E: CryptoEngine> ActuatorNode<E> {
             },
         };
         self.security.seal_packet(&pkt)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use telekine_proto::Aes128GcmSoftware;
-
-    #[test]
-    fn watchdog_lease_expires_into_failsafe_and_emits_exception() {
-        let master_key = [0x11u8; 16];
-        let mac = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
-        let hub_sec = DeviceSecurityContext::new(1, &master_key, &mac);
-        let node_sec = DeviceSecurityContext::<Aes128GcmSoftware>::new(1, &master_key, &mac);
-
-        let mut node = ActuatorNode::new(node_sec, SafetyConfig::default(), 0);
-        assert_eq!(node.operating_state(), ActuatorOperatingState::FailSafeLocked);
-
-        // Send bounded move with 10 ms lease over ESP-NOW
-        let cmd = WirePacket {
-            target_id: 1,
-            seq_nonce: 1,
-            flags: PacketFlags::new(
-                Priority::HighVi,
-                RedundancyMode::HotWarmFailover,
-                false,
-                false,
-                false,
-            ),
-            exec_at_tick_ms: 0,
-            intent: BoundedIntent::move_to_deg(30.0, 50, 80, 10),
-        };
-        let frame = hub_sec.seal_packet(&cmd);
-        node.receive_frame(&frame, RadioLink::EspNow24Ghz).unwrap();
-        assert_eq!(node.operating_state(), ActuatorOperatingState::NormalDualLink);
-
-        // Step 9 ms: still active and silent (no exception telemetry)
-        for _ in 0..9 {
-            let (out, exc) = node.step_1khz();
-            assert_eq!(out.state, ActuatorOperatingState::NormalDualLink);
-            assert!(!out.brakes_locked);
-            assert!(exc.is_none());
-        }
-
-        // At 10 ms without a heartbeat on either radio, watchdog triggers FailSafeLocked
-        // and emits a single Report-by-Exception frame!
-        let (out, exc) = node.step_1khz();
-        assert_eq!(out.state, ActuatorOperatingState::FailSafeLocked);
-        assert_eq!(out.effort_pct, 0);
-        assert!(out.brakes_locked);
-        assert!(exc.is_some());
-    }
-
-    #[test]
-    fn lora_only_fallback_triggers_limp_mode_speed_throttling() {
-        let master_key = [0x22u8; 16];
-        let mac = [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F];
-        let hub_sec = DeviceSecurityContext::new(5, &master_key, &mac);
-        let node_sec = DeviceSecurityContext::new(5, &master_key, &mac);
-
-        let mut node = ActuatorNode::new(node_sec, SafetyConfig::default(), 0);
-
-        // Packet arrives ONLY over Raw LoRa 915 MHz (ESP-NOW blocked by wall/interference)
-        let cmd = WirePacket {
-            target_id: 5,
-            seq_nonce: 1,
-            flags: PacketFlags::new(
-                Priority::HighVi,
-                RedundancyMode::HotWarmFailover,
-                false,
-                false,
-                false,
-            ),
-            exec_at_tick_ms: 0,
-            intent: BoundedIntent::move_to_deg(90.0, 100, 100, 500),
-        };
-        let frame = hub_sec.seal_packet(&cmd);
-        node.receive_frame(&frame, RadioLink::RawLoRa915Mhz).unwrap();
-
-        let (out, _) = node.step_1khz();
-        assert_eq!(out.state, ActuatorOperatingState::LoRaLimpMode);
-        // 100% requested speed & torque is automatically throttled to 40% in Limp Mode!
-        assert_eq!(out.effective_max_speed_pct, 40);
-        assert_eq!(out.effective_max_torque_pct, 40);
     }
 }

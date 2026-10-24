@@ -1,68 +1,75 @@
 //! # `telekine-py`
 //!
 //! C-ABI / PyO3-ready bridge and AI Agent Tool Schema generator exposing Telekine's
-//! **Bounded Intents** to Python LLM orchestrators (OpenAI, Gemini, Anthropic, MCP, ROS 2).
-//!
-//! Ensures an LLM can never synthesize an unbounded open-loop command: every tool schema
-//! requires `max_speed_pct`, `max_torque_pct`, and `lease_timeout_ms`.
+//! **Demo 1 Foundational Unit Discovery, Access Claiming, and Bounded Intents**
+//! (`Servo`, `Stepper`, `DcMotor`) to Python LLM orchestrators.
 
-use telekine_host::SwarmHubCoordinator;
-use telekine_proto::{BoundedIntent, Priority, RedundancyMode};
+use telekine_host::{DiscoveredUnitInfo, SwarmHubCoordinator};
+use telekine_proto::{BoundedIntent, Priority, RedundancyMode, UnitElementKind};
 
-/// JSON Schema definition for AI Agent tool-calling (MCP / OpenAI / Gemini function declarations)
-/// enforcing bounded goal states rather than open-loop toggles.
-pub const AI_AGENT_TOOL_SCHEMA_JSON: &str = r#"{
-  "name": "telekine_dispatch_bounded_intent",
-  "description": "Dispatch a hardware-bounded physical goal state to one actuator (0..65533) or the entire 1,000-node swarm (65535) over dual-redundant ESP-NOW (2.4 GHz) + Raw LoRa (915 MHz). Never sends open-loop toggles; the actuator closes the 1 kHz loop locally and enters fail-safe if the watchdog lease expires.",
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "target_id": {
-        "type": "integer",
-        "minimum": 0,
-        "maximum": 65535,
-        "description": "2-byte connectionless node address (0..65533 for unicast, 65535 for Triple-Burst swarm broadcast)."
-      },
-      "angle_deg": {
-        "type": "number",
-        "description": "Target bounded goal angle in degrees."
-      },
-      "max_speed_pct": {
-        "type": "integer",
-        "minimum": 1,
-        "maximum": 100,
-        "description": "Maximum allowed speed percentage (automatically throttled in LoRa Limp Mode)."
-      },
-      "max_torque_pct": {
-        "type": "integer",
-        "minimum": 1,
-        "maximum": 100,
-        "description": "Maximum allowed torque/effort percentage."
-      },
-      "lease_timeout_ms": {
-        "type": "integer",
-        "minimum": 50,
-        "maximum": 5000,
-        "description": "Dual-Link Dead-Man's Switch lease duration in milliseconds (typical: 250-1000 ms)."
-      },
-      "redundancy_mode": {
-        "type": "string",
-        "enum": ["HOT_HOT_TWIN_CAST", "HOT_WARM_FAILOVER", "TRIPLE_BURST_BROADCAST"]
-      },
-      "priority": {
-        "type": "string",
-        "enum": ["BACKGROUND_BK", "NORMAL_BE", "HIGH_VI", "CRITICAL_VO", "VIP_EMERGENCY"]
-      },
-      "exec_at_tick_ms": {
-        "type": "integer",
-        "description": "Optional synchronized millisecond timestamp for Sync-and-Fire swarm execution."
+/// JSON Schema definitions for AI Agent tool-calling (MCP / OpenAI / Gemini function declarations)
+/// supporting Demo 1's 4-step workflow:
+/// 1. `telekine_discover_units`
+/// 2. `telekine_claim_unit_access`
+/// 3. `telekine_dispatch_bounded_intent`
+/// 4. `telekine_release_unit_access`
+pub const AI_AGENT_TOOL_SCHEMA_JSON: &str = r#"[
+  {
+    "name": "telekine_discover_units",
+    "description": "Broadcast a discovery probe on Master Manager Channel 1 to find nearby compatible Telekine Foundational Units (SERVO, STEPPER, DC_MOTOR) and check whether they are IDLE_AVAILABLE or CLAIMED_BY_HUB.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "filter_kind": {
+          "type": "string",
+          "enum": ["ALL", "SERVO", "STEPPER", "DC_MOTOR"],
+          "description": "Optional filter to discover only Servo, Stepper, or DC Motor units."
+        }
       }
-    },
-    "required": ["target_id", "angle_deg", "max_speed_pct", "max_torque_pct", "lease_timeout_ms"]
+    }
+  },
+  {
+    "name": "telekine_claim_unit_access",
+    "description": "Claim exclusive control access to a discovered Servo, Stepper, or DC Motor unit for a bounded lease window and assign it to the Hub's high-speed Worker Channel.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "target_id": { "type": "integer", "minimum": 0, "maximum": 65533 },
+        "access_lease_ms": { "type": "integer", "minimum": 100, "maximum": 10000 }
+      },
+      "required": ["target_id", "access_lease_ms"]
+    }
+  },
+  {
+    "name": "telekine_dispatch_bounded_intent",
+    "description": "Dispatch a hardware-bounded physical goal state to a claimed Servo, Stepper, or DC Motor unit over dual-redundant ESP-NOW (2.4 GHz) + Raw LoRa (915 MHz).",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "target_id": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "angle_deg": { "type": "number", "description": "Target bounded goal angle/position in degrees." },
+        "max_speed_pct": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "max_torque_pct": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "lease_timeout_ms": { "type": "integer", "minimum": 50, "maximum": 5000 }
+      },
+      "required": ["target_id", "angle_deg", "max_speed_pct", "max_torque_pct", "lease_timeout_ms"]
+    }
+  },
+  {
+    "name": "telekine_release_unit_access",
+    "description": "Release a claimed Servo, Stepper, or DC Motor unit back to safe idle on Master Channel 1 when the AI Agent finishes using it.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "target_id": { "type": "integer", "minimum": 0, "maximum": 65533 }
+      },
+      "required": ["target_id"]
+    }
   }
-}"#;
+]"#;
 
-/// High-level FFI handle for Python / C callers to drive `SwarmHubCoordinator`.
+/// High-level FFI handle for Python / C AI Agents to discover, claim, control, and release
+/// Foundational Units (`Servo`, `Stepper`, `DcMotor`).
 pub struct TelekineAgentBridge {
     pub coordinator: SwarmHubCoordinator,
 }
@@ -74,8 +81,39 @@ impl TelekineAgentBridge {
         }
     }
 
-    /// Dispatch a bounded move command from an AI agent tool call and return the raw
-    /// 32-byte encrypted frames ready for USB-CDC / UART / UDP transmission.
+    pub fn discover_units(&mut self, filter_kind: UnitElementKind) -> Vec<[u8; 32]> {
+        self.coordinator
+            .broadcast_discovery_probe(filter_kind)
+            .into_iter()
+            .map(|tx| tx.frame.0)
+            .collect()
+    }
+
+    pub fn list_units(&self, filter_kind: Option<UnitElementKind>) -> Vec<DiscoveredUnitInfo> {
+        self.coordinator.list_discovered_units(filter_kind)
+    }
+
+    pub fn claim_unit(
+        &mut self,
+        now_ms: u32,
+        target_id: u16,
+        access_lease_ms: u16,
+    ) -> Result<Vec<[u8; 32]>, &'static str> {
+        let txs = self
+            .coordinator
+            .claim_unit_access(now_ms, target_id, access_lease_ms)?;
+        Ok(txs.into_iter().map(|tx| tx.frame.0).collect())
+    }
+
+    pub fn release_unit(
+        &mut self,
+        now_ms: u32,
+        target_id: u16,
+    ) -> Result<Vec<[u8; 32]>, &'static str> {
+        let txs = self.coordinator.release_unit_access(now_ms, target_id)?;
+        Ok(txs.into_iter().map(|tx| tx.frame.0).collect())
+    }
+
     pub fn dispatch_agent_move(
         &mut self,
         now_ms: u32,

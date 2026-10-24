@@ -1,24 +1,24 @@
 //! # `telekine-host`
 //!
-//! Host & Hub orchestration engine scaling to **1,000+ actuators** and **100+ hubs**:
-//! - **Per-Device Key Management:** Derives unique AES-128-GCM keys per actuator from
-//!   `(master_key, device_mac, target_id)`.
-//! - **Hot-Hot (Twin-Cast):** Fires critical commands and E-Stops over both 2.4 GHz ESP-NOW
-//!   and 915 MHz Raw LoRa simultaneously with the same `seq_nonce`.
-//! - **Hot-Warm (3 ms Auto-Failover):** Fires routine commands over ESP-NOW first (using the
-//!   16-slot RAM peer-swap ring buffer); if the hardware `ACK` does not arrive within `3 ms`,
-//!   automatically fires the identical encrypted packet over Raw LoRa.
-//! - **Triple-Burst Broadcasts:** Fires unacknowledged 1,000-peer broadcasts 3 times in rapid
-//!   succession with the same `seq_nonce` to drive packet loss below `0.1%`.
-//! - **Master Manager Channel & TDMA Scheduler:** Emits synchronized clock beacons on Channel 1
-//!   and assigns actuators to Worker Channels (Channels 6 & 11) and millisecond TDMA slots.
+//! Host & AI Hub orchestration engine scaling to **1,000+ actuators** and **100+ hubs**,
+//! featuring **Demo 1 Foundational Unit Discovery & Dynamic Access Lease** for
+//! **`Servo`**, **`Stepper`**, and **`DcMotor`** units:
+//! - **Master Channel 1 Auto-Discovery (`broadcast_discovery_probe` & `ingest_discovery_announce`):**
+//!   Discovers nearby compatible `Servo`, `Stepper`, and `DcMotor` units and tracks their
+//!   `UnitAccessState` (`IdleAvailable`, `ClaimedByHub`, `Faulted`).
+//! - **On-Demand Unit Access Claiming (`claim_unit_access` & `release_unit_access`):**
+//!   Claims exclusive control of a discovered unit only when the AI Agent needs it, assigning
+//!   its Worker Channel (`6` or `11`) and TDMA slot, and releases it back to `IdleAvailable` when done.
+//! - **Hot-Hot (Twin-Cast) & Hot-Warm (3 ms Auto-Failover):** Dual-radio redundancy across
+//!   2.4 GHz ESP-NOW and 915 MHz Semtech SX1262 Raw LoRa.
 
 use std::collections::HashMap;
 use telekine_firmware::{Sx1262LoRaConfig, WmmAccessCategory};
 use telekine_proto::{
-    derive_broadcast_key, seal_with_key, Aes128GcmSoftware, BoundedIntent, DeviceSecurityContext,
-    EncryptedFrame, PacketFlags, Priority, RadioLink, RedundancyMode, TelemetryExceptionCode,
-    WirePacket, BROADCAST_TARGET_ID, MASTER_CHANNEL_TARGET_ID,
+    derive_broadcast_key, open_with_key, seal_with_key, Aes128GcmSoftware, BoundedIntent,
+    DeviceSecurityContext, EncryptedFrame, PacketFlags, Priority, RadioLink, RedundancyMode,
+    SecurityError, TelemetryExceptionCode, UnitAccessState, UnitElementKind, WirePacket,
+    BROADCAST_TARGET_ID, MASTER_CHANNEL_TARGET_ID,
 };
 
 /// Default hardware ACK timeout in milliseconds before Hot-Warm mode fails over to 915 MHz LoRa.
@@ -43,6 +43,16 @@ pub struct ScheduledTransmission {
     pub frame: EncryptedFrame,
 }
 
+/// Metadata for a Foundational Unit (`Servo`, `Stepper`, or `DcMotor`) discovered by the AI Hub.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DiscoveredUnitInfo {
+    pub target_id: u16,
+    pub element_kind: UnitElementKind,
+    pub access_state: UnitAccessState,
+    pub claimed_by_hub_id: u8,
+    pub max_travel_deg: f32,
+}
+
 /// Registered actuator entry in the Hub's 1,000+ peer directory.
 #[derive(Debug, Clone)]
 pub struct RegisteredPeer {
@@ -53,6 +63,7 @@ pub struct RegisteredPeer {
     pub tdma_slot_index: u16,
     pub next_seq_nonce: u32,
     pub security: DeviceSecurityContext<Aes128GcmSoftware>,
+    pub discovered_info: Option<DiscoveredUnitInfo>,
     pub last_reported_exception: Option<(u32, TelemetryExceptionCode, f32)>,
 }
 
@@ -66,7 +77,7 @@ pub struct PendingHotWarmFailover {
     pub fallback_lora_tx: ScheduledTransmission,
 }
 
-/// Central AI Swarm Hub Coordinator managing 1,000+ dual-radio actuators.
+/// Central AI Swarm Hub Coordinator managing 1,000+ dual-radio actuators and Foundational Units.
 pub struct SwarmHubCoordinator {
     hub_id: u8,
     master_key: [u8; 16],
@@ -118,9 +129,154 @@ impl SwarmHubCoordinator {
                 tdma_slot_index: target_id % 1000,
                 next_seq_nonce: 0,
                 security,
+                discovered_info: None,
                 last_reported_exception: None,
             },
         );
+    }
+
+    /// **Step 1 (Discovery):** Broadcast a `DiscoverUnitsProbe` on Master Manager Channel 1
+    /// (`target_id = 0xFFFE`) to discover compatible `Servo`, `Stepper`, or `DcMotor` units.
+    /// Pass `UnitElementKind::Unknown` to discover all unit types at once.
+    pub fn broadcast_discovery_probe(
+        &mut self,
+        filter_kind: UnitElementKind,
+    ) -> Vec<ScheduledTransmission> {
+        self.broadcast_seq_nonce = self.broadcast_seq_nonce.wrapping_add(1);
+        let pkt = WirePacket {
+            target_id: MASTER_CHANNEL_TARGET_ID,
+            seq_nonce: self.broadcast_seq_nonce,
+            flags: PacketFlags::new(
+                Priority::HighVi,
+                RedundancyMode::HotHotTwinCast,
+                false,
+                true,
+                false,
+            ),
+            exec_at_tick_ms: 0,
+            intent: BoundedIntent::DiscoverUnitsProbe {
+                hub_id: self.hub_id,
+                filter_kind,
+            },
+        };
+        let frame = seal_with_key(&Aes128GcmSoftware, &self.broadcast_key, &pkt);
+        vec![
+            ScheduledTransmission {
+                link: RadioLink::EspNow24Ghz,
+                dest_mac: [0xFF; 6],
+                espnow_channel: 1, // Master Manager Channel 1
+                wmm_ac: WmmAccessCategory::VideoAcVi,
+                lora_profile: Sx1262LoRaConfig::worker_default(0),
+                tx_power_dbm: 17,
+                frame,
+            },
+            ScheduledTransmission {
+                link: RadioLink::RawLoRa915Mhz,
+                dest_mac: [0xFF; 6],
+                espnow_channel: 0,
+                wmm_ac: WmmAccessCategory::VideoAcVi,
+                lora_profile: Sx1262LoRaConfig::worker_default(0),
+                tx_power_dbm: 18,
+                frame,
+            },
+        ]
+    }
+
+    /// Authenticate and ingest a `UnitDiscoveryAnnounce` reply frame sent by a Foundational Unit,
+    /// updating the Hub's discovery directory.
+    pub fn ingest_discovery_announce(
+        &mut self,
+        frame: &EncryptedFrame,
+    ) -> Result<DiscoveredUnitInfo, SecurityError> {
+        let pkt = open_with_key(&Aes128GcmSoftware, &self.broadcast_key, frame)?;
+        let node_id = pkt.exec_at_tick_ms as u16;
+        match pkt.intent {
+            BoundedIntent::UnitDiscoveryAnnounce {
+                element_kind,
+                access_state,
+                claimed_by_hub_id,
+                max_travel_q16,
+            } => {
+                let info = DiscoveredUnitInfo {
+                    target_id: node_id,
+                    element_kind,
+                    access_state,
+                    claimed_by_hub_id,
+                    max_travel_deg: (max_travel_q16 as f32) / 65536.0,
+                };
+                if let Some(peer) = self.peers.get_mut(&node_id) {
+                    peer.discovered_info = Some(info);
+                }
+                Ok(info)
+            }
+            _ => Err(SecurityError::MalformedOpcode),
+        }
+    }
+
+    /// List all discovered Foundational Units (`Servo`, `Stepper`, `DcMotor`), optionally filtered by kind.
+    pub fn list_discovered_units(
+        &self,
+        filter_kind: Option<UnitElementKind>,
+    ) -> Vec<DiscoveredUnitInfo> {
+        let mut out: Vec<DiscoveredUnitInfo> = self
+            .peers
+            .values()
+            .filter_map(|p| p.discovered_info)
+            .filter(|info| filter_kind.map(|k| info.element_kind == k).unwrap_or(true))
+            .collect();
+        out.sort_by_key(|i| i.target_id);
+        out
+    }
+
+    /// **Step 2 (Gain Access When Needed):** Claim exclusive control of a discovered unit
+    /// (`Servo`, `Stepper`, or `DcMotor`) for `access_lease_ms` and assign it to this Hub's
+    /// Worker Channel and TDMA slot.
+    pub fn claim_unit_access(
+        &mut self,
+        now_ms: u32,
+        target_id: u16,
+        access_lease_ms: u16,
+    ) -> Result<Vec<ScheduledTransmission>, &'static str> {
+        let peer = self
+            .peers
+            .get(&target_id)
+            .ok_or("target_id not registered in Hub peer table")?;
+        let worker_channel = peer.worker_channel;
+        let tdma_slot_index = peer.tdma_slot_index;
+
+        let intent = BoundedIntent::ClaimUnitAccess {
+            hub_id: self.hub_id,
+            espnow_worker_channel: worker_channel,
+            tdma_slot_index,
+            access_lease_ms,
+        };
+        self.dispatch_unicast(
+            now_ms,
+            target_id,
+            intent,
+            Priority::CriticalVo,
+            RedundancyMode::HotHotTwinCast,
+            None,
+        )
+    }
+
+    /// **Step 4 (Release Access):** Release a claimed unit back to `IdleAvailable` on Master Channel 1.
+    pub fn release_unit_access(
+        &mut self,
+        now_ms: u32,
+        target_id: u16,
+    ) -> Result<Vec<ScheduledTransmission>, &'static str> {
+        let intent = BoundedIntent::ReleaseUnitAccess {
+            hub_id: self.hub_id,
+        };
+        self.dispatch_unicast(
+            now_ms,
+            target_id,
+            intent,
+            Priority::CriticalVo,
+            RedundancyMode::HotHotTwinCast,
+            None,
+        )
     }
 
     /// Dispatch a **Bounded Intent** to a single actuator using either:
@@ -222,10 +378,6 @@ impl SwarmHubCoordinator {
     }
 
     /// **Triple-Burst Swarm Broadcast (`target_id = 0xFFFF`)**
-    ///
-    /// Fires the broadcast packet **3 times in rapid succession** on ESP-NOW with the exact
-    /// same `seq_nonce` (plus a simultaneous LoRa broadcast if `HotHotTwinCast` or `VipEmergency`),
-    /// driving unacknowledged broadcast packet loss across 1,000 peers below `0.1%`.
     pub fn dispatch_swarm_broadcast(
         &mut self,
         intent: BoundedIntent,
@@ -261,7 +413,6 @@ impl SwarmHubCoordinator {
             frame,
         };
 
-        // 3 rapid-succession bursts with identical seq_nonce
         let mut txs = vec![esp_burst.clone(), esp_burst.clone(), esp_burst];
 
         if include_lora_twincast || priority == Priority::VipEmergency {
@@ -310,7 +461,7 @@ impl SwarmHubCoordinator {
             ScheduledTransmission {
                 link: RadioLink::EspNow24Ghz,
                 dest_mac: [0xFF; 6],
-                espnow_channel: 1, // Reserved Master Manager Channel 1
+                espnow_channel: 1,
                 wmm_ac: WmmAccessCategory::VoiceAcVo,
                 lora_profile: Sx1262LoRaConfig::worker_default(0),
                 tx_power_dbm: 20,

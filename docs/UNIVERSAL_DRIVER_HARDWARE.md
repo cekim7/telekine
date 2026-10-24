@@ -1,88 +1,57 @@
-# Telekine Universal Hardware Driver ("Telekine Puck") Specification
+# Telekine Foundational Unit Driver ("Telekine Unit Stamp V1")
 
-**Form Factor:** `42 mm × 42 mm` (NEMA-17 backplate mountable + M3 DIN-rail/frame ears)  
-**Target BOM Cost:** `~$9.80 @ 1k qty`  
-**Firmware Layer:** `telekine_firmware::universal_driver::UniversalDriverController`
-
----
-
-## 1. Design Philosophy: One Module, Any Low-Intelligence Object
-
-To retrofit **1,000+ diverse, low-intelligence actuators** (brushed DC motors, RC servos, industrial 24V solenoid valves, NEMA steppers, 0–10V dampers, and CAN/RS-485 motor drives) without redesigning PCBs or rewriting safety firmware, the **Telekine Universal Driver** splits the hardware into:
-
-1. **The Core-Stamp (Always Identical):** Dual-radio RF (`ESP32-S3` + `Semtech SX1262`), hardware crypto, **Hardware Dead-Man's Switch Interlock Gate (`SAFE_ENABLE`)**, wide `6V–60V DC` buck power supply, and a multi-protocol output stage.
-2. **Smart Harness Auto-ID (`ID_SENSE`):** Each pluggable actuator cable harness carries a `$0.15` 1-Wire EEPROM (`DS2431`) or precision ID resistor. When plugged into any hardware component, the Telekine Puck reads `ID_SENSE` at boot and configures its pin mux, voltage/current limits, and `HardwarePersonality` automatically.
+**Target Demo 1 Hardware:** Universal AI-Native Driver for **Servo**, **Stepper**, and **Brushed DC Motors**  
+**Form Factor:** `28 mm × 28 mm` (Mounts on NEMA-17 backplate, DC motor tail, or inline Servo cable)  
+**Target BOM Cost:** `~$8.40 @ 1k qty`  
+**Firmware Implementation:** `telekine_firmware::universal_driver::UniversalDriverController`
 
 ---
 
-## 2. System Block Diagram
+## 1. How One Tiny Board Drives a Servo, a Stepper, or a DC Motor
+
+The **Telekine Unit Stamp V1** uses a **Software-Defined Quad Half-Bridge (`TI DRV8847` / `DRV8908` or dual `DRV8876`)** plus a **5V Level-Shifted Servo PWM Pin** on a single 6-pin spring terminal block (`[VIN+] [GND] [CH1] [CH2] [CH3] [CH4]`).
+
+At power-on, the board **auto-probes coil impedance** across `CH1..CH4` (or reads the mode strap) and wakes up on **Master Manager Channel 1 (`2.4 GHz ESP-NOW + 915 MHz Raw LoRa`)**, ready for any Telekine AI Hub to discover, claim access on demand, and control:
+
+| Foundational Unit | How You Wire It to `CH1..CH4` | Auto-Probe Signature | Local 1 kHz Execution & Fail-Safe |
+| :--- | :--- | :--- | :--- |
+| **1. `Servo`** (RC / Industrial PWM Servo) | `CH1` = `5V Power`, `CH2` = `PWM Signal (50-333 Hz)`, `GND` = `GND` | High impedance on `CH2` (`>10 kΩ`) + 5V buck rail active on `CH1` | Slew-rate limits angle (`1000..2000 µs`); throttles speed to 40% in LoRa Limp Mode; tri-states PWM when lease expires. |
+| **2. `Stepper`** (4-Wire Bipolar Stepper, e.g., NEMA-17) | `CH1+CH2` = `Coil A (A+, A-)`, `CH3+CH4` = `Coil B (B+, B-)` | Two matched inductive coils (`1.5–30 Ω`) on `CH1-CH2` and `CH3-CH4` | Drives microstepped current waveforms (or `STEP/DIR` to external high-power drive); locks holding brake or de-energizes on watchdog expiry. |
+| **3. `DcMotor`** (2-Wire Brushed DC Motor / Linear Actuator) | `CH1+CH2` = `Motor M+ / M-` (bridges `CH3+CH4` in parallel for `2x` current up to `4A`) | Single inductive coil (`1–20 Ω`) across `CH1-CH2` | Closes 1 kHz position/velocity loop using onboard magnetic encoder (`AS5600`/`MT6835`) or Back-EMF ripple; trips `MotorStallDetected` on `IPROPI` spike. |
+
+---
+
+## 2. Hardware Block Diagram (Telekine Unit Stamp V1)
 
 ```text
-                  +---------------------------------------------------------------+
-                  |             TELEKINE UNIVERSAL DRIVER (42x42 mm)              |
-                  |                                                               |
- [2.4GHz Ant] --->|  +-----------------------+       SPI2      +---------------+  |
-                  |  |   ESP32-S3-WROOM-1    |<--------------->| Semtech SX1262|  |<--- [915MHz Ant]
-                  |  | - ESP-NOW (WMM AC_VO) |                 | Raw LoRa SF7  |  |
-                  |  | - HW AES-128-GCM      |                 +---------------+  |
-                  |  | - 1kHz Safety Loop    |                                    |
-                  |  +-----------+-----------+                                    |
-                  |              | WD_PULSE (1kHz charge-pump watchdog)           |
- [E-STOP LOOP] -->|--------------+---> [HW AND GATE: SN74LVC1G08] ===> SAFE_ENABLE|
-                  |                                                       |       |
- [6V-60V DC IN] ->|  [TI LM5164 Buck -> 5V/3.3V]                          v       |
-                  |  +---------------------------------------------------------+  |
-                  |  |         UNIVERSAL OUTPUT & FEEDBACK MULTIPLEXER         |  |
-                  |  |                                                         |  |
-                  |  | 1. DRV8876 H-Bridge (36V/3.5A + IPROPI Current Sense)   |==+==> Brushed DC / Solenoid
-                  |  | 2. 5V Level-Shifted PWM / STEP-DIR (SN74AHCT125)        |==+==> Servos / ESCs / Steppers
-                  |  | 3. CAN-FD (TCAN1044V) + RS-485 (SN65HVD72)              |==+==> ODrive / VESC / Modbus VFD
-                  |  | 4. 0-10V Analog Out (Op-Amp) + Isolated SSR Gate        |==+==> Industrial Valves / Relays
-                  |  | 5. Universal Feedback (Quad ABZ / I2C AS5600 / 0-3V ADC)|<=+=== Encoder / Pot / Limit SW
-                  |  | 6. 1-Wire ID_SENSE (DS2431 EEPROM on Cable Harness)     |<=+=== Auto-Config Personality
-                  |  +---------------------------------------------------------+  |
-                  +---------------------------------------------------------------+
+          TOP SIDE (Wireless & Terminal Side)              BOTTOM SIDE (Shaft Sensor Side)
+    +--------------------------------------------+   +--------------------------------------------+
+    | [USB-C]      [Status RGB]     [Teach/Zero] |   |                                            |
+    |                                            |   |      +------------------------------+      |
+    | +--------------------+   +---------------+ |   |      | Dual DRV8876 / DRV8847       |      |
+    | |  ESP32-S3-MINI-1   |   | Semtech SX1262| |   |      | 4-Half-Bridge Power Stage    |      |
+    | |  - 2.4GHz ESP-NOW  |   | - 915MHz LoRa | |   |      | (Up to 36V, 3.5A + IPROPI    |      |
+    | |  - HW AES-128-GCM  |   | - SF7 VIP Ch  | |   |      |  Analog Stall Current Sense) |      |
+    | +---------+----------+   +-------+-------+ |   |      +------------------------------+      |
+    |           | WD_PULSE (1kHz)      |         |   |                                            |
+    | [TPS3430 Hardware Watchdog] ---> SAFE_EN   |   |           ( ( [AS5600 / MT6835] ) )        |
+    |                                            |   |         Center-Mounted On-Axis Hall        |
+    | +----------------------------------------+ |   |         Magnetic Rotary Encoder IC         |
+    | |  6-Pin Push-Lever Terminal (Wago 2060) | |   |                                            |
+    | |  [VIN+] [GND] [CH1] [CH2] [CH3] [CH4]  | |   |           [BMI270 6-Axis IMU]              |
+    | +----------------------------------------+ |   |                                            |
+    +--------------------------------------------+   +--------------------------------------------+
 ```
 
 ---
 
-## 3. Bill of Materials (Core Subsystems)
+## 3. Demo 1 Protocol Flow: Discover $\rightarrow$ Claim Access $\rightarrow$ Control $\rightarrow$ Release
 
-| Subsystem | Part Number | Role in Telekine | Approx. Cost (1k) |
-| :--- | :--- | :--- | :--- |
-| **Primary MCU & 2.4 GHz Radio** | `ESP32-S3-WROOM-1-N8` | Runs 2.4 GHz ESP-NOW (`1–3 ms`), hardware AES-128-GCM, Secure Boot/Flash Encryption, and local 1 kHz PID + Watchdog lease. | $2.20 |
-| **915 MHz Raw LoRa Radio** | `Semtech SX1262` (e.g. E22-900M22S) | Long-range wall-penetrating backup (`30–80 ms`, `+22 dBm` Capture Effect, `SF7` VIP Emergency channel). | $3.80 |
-| **Wide-Input Buck Regulator** | `TI LM5164` (`6V–60V` to `5V` 1A) + `AP2112K-3.3` | Allows powering the node directly from 12V/24V industrial rails, 3S–12S LiPo packs, or 48V robot buses. | $1.10 |
-| **Hardware Safety Interlock** | `TPS3430` Window Watchdog + `SN74LVC1G08` AND Gate | Requires a continuous 1 kHz `WD_PULSE` from `telekine-core`. If both radios drop past the lease or the MCU hangs, `SAFE_ENABLE` drops to `0V` in hardware within `< 5 ms`. | $0.45 |
-| **Integrated Power H-Bridge** | `TI DRV8876` (`36V`, `3.5A` peak, `IPROPI` sense) | Directly drives brushed DC motors, linear actuators, pneumatic solenoids, or electromagnetic brakes with hardware stall-current sensing. | $0.95 |
-| **Fieldbus Transceivers** | `TCAN1044V` (CAN-FD) + `SN65HVD72` (RS-485) | Directly drives high-power external BLDC drives (ODrive, VESC), industrial VFDs (Modbus RTU), and serial bus servos. | $0.85 |
-| **5V PWM / Step-Dir Buffer** | `SN74AHCT125` Quad Tri-State Buffer (`OE` tied to `SAFE_ENABLE`) | Drives 5V RC servos, drone ESCs, and external stepper drivers (`STEP`/`DIR`/`EN`), tri-stated immediately when `SAFE_ENABLE` trips. | $0.20 |
-| **Connectors & Protection** | `XT30` Power + `JST-GH 10-pin` Universal I/O + `TVS` Diodes | Reverse-polarity MOSFET protection, ESD diodes on all I/O lines, and u.FL / SMA antenna jacks. | $0.30 |
-
----
-
-## 4. ESP32-S3 Pinout & Bus Allocation
-
-| Signal Group | ESP32-S3 GPIO | Direction | Function |
-| :--- | :--- | :--- | :--- |
-| **SX1262 LoRa (SPI2)** | `GPIO10..14` | `SPI + IRQ` | `NSS=10`, `MOSI=11`, `SCK=12`, `MISO=13`, `DIO1=14`, `BUSY=21`, `NRST=47` |
-| **Hardware Watchdog Gate** | `GPIO1` (`WD_PULSE`), `GPIO2` (`E_STOP_SENSE`) | `OUT / IN` | 1 kHz charge-pump pulse feeding `TPS3430` $\rightarrow$ `SAFE_ENABLE` hardware gate |
-| **H-Bridge & PWM / Step-Dir** | `GPIO4` (`OUT_A / STEP / PWM1`), `GPIO5` (`OUT_B / DIR / PWM2`), `GPIO6` (`nSLEEP / EN`) | `OUT (MCPWM)` | Multiplexed via `HardwarePersonality` between `DRV8876`, `STEP/DIR`, and `RC PWM` |
-| **Current Sense (`IPROPI`)** | `GPIO7` (`ADC1_CH6`) | `ANALOG IN` | Reads motor/solenoid current in real time; trips `MotorStallDetected` on spike |
-| **CAN-FD & RS-485 Fieldbus** | `GPIO15..18` | `TWAI / UART1` | `CAN_TX=15`, `CAN_RX=16`, `RS485_TX=17`, `RS485_RX=18`, `RS485_DE=8` |
-| **Universal Feedback Port** | `GPIO38..42` | `PCNT / I2C` | `ENC_A=38`, `ENC_B=39`, `ENC_Z=40` (or `I2C SDA/SCL` for AS5600 magnetic encoder) |
-| **Smart Harness Auto-ID** | `GPIO9` (`ID_SENSE`) | `1-Wire / ADC` | Reads harness EEPROM or resistor divider on boot to select `HardwarePersonality` |
-
----
-
-## 5. How Diverse Hardware Connects to the Universal 10-Pin Port
-
-| Target Hardware | Harness Personality ID | Pins Used on Universal Port | Local 1 kHz Safety & Fail-Safe Behavior |
-| :--- | :--- | :--- | :--- |
-| **1. Brushed DC Gearmotor / Linear Actuator** | `HBridgeBrushedDc (0x02)` | `MOT+`, `MOT-` (`DRV8876`), `ENC_A/B` (or Potentiometer ADC) | Closes 1 kHz position loop via encoder; monitors `IPROPI` for stall; active short-brake when watchdog lease expires. |
-| **2. RC Servo / Brushless Thruster ESC** | `PwmServoOrEsc (0x01)` | `5V_OUT`, `PWM1` (`1000–2000 µs`), `GND` | Slew-rate limits angle/throttle in software (40% max in LoRa Limp Mode); `SN74AHCT125` tri-states PWM on fail-safe. |
-| **3. NEMA-17 / NEMA-23 Stepper Motor** | `StepperStepDir (0x03)` | `STEP`, `DIR`, `EN` (5V buffered), `LIMIT_SW` | Generates deterministic step frequency with acceleration ramp; de-asserts `EN` (or holds brake) on lease timeout. |
-| **4. 12V/24V Solenoid Valve or Contactor** | `SolenoidOrRelay (0x04)` | `MOT+`, `MOT-` (`DRV8876` in high-side/low-side PWM mode) | Applies 100% pull-in current for `50 ms`, then drops to 30% PWM hold current; hardware gate forces valve **CLOSED** on lease timeout. |
-| **5. High-Power BLDC (ODrive / VESC / MIT Joint)** | `CanBusSmartActuator (0x05)` | `CAN_H`, `CAN_L`, `GND` | Translates `BoundedIntent` into 1 kHz cyclic CAN frames; sends `0 Nm` torque + hardware `E_STOP` on watchdog expiry. |
-| **6. Industrial VFD / Smart Bus Servo (Dynamixel)** | `Rs485SerialActuator (0x06)` | `RS485_A`, `RS485_B`, `GND` | Streams bounded velocity/position registers over half-duplex RS-485 with automatic CRC and fail-safe stop packet. |
-| **7. HVAC Damper / Analog Process Valve** | `Analog0To10V (0x07)` | `ANALOG_0_10V`, `GND`, `POS_SENSE_ADC` | Drives 0–10V proportional setpoint; drops to `0.0V` fail-safe state when `SAFE_ENABLE` trips. |
+1. **Boot & Self-Probe:**
+   Each Telekine Unit Stamp powers up, probes `CH1..CH4` to identify whether it is attached to a **`Servo`**, **`Stepper`**, or **`DcMotor`**, sets its state to `UnitAccessState::IdleAvailable`, and listens on **Master Manager Channel 1**.
+2. **AI Hub Discovery (`DiscoverUnitsProbe` $\rightarrow$ `UnitDiscoveryAnnounce`):**
+   The AI Hub broadcasts a `DiscoverUnitsProbe` (`opcode = 0x20`). Every unit in range replies with an encrypted `UnitDiscoveryAnnounce` (`opcode = 0x21`) reporting its `node_id`, `UnitElementKind` (`Servo`, `Stepper`, `DcMotor`), `UnitAccessState` (`IdleAvailable` vs `ClaimedByHub`), and calibrated travel range.
+3. **On-Demand Access Lease (`ClaimUnitAccess`):**
+   When the AI Agent decides it needs `Node #1 (Servo)` and `Node #2 (Stepper)`, the Hub sends `ClaimUnitAccess` (`opcode = 0x22`). Each claimed unit locks itself to that `hub_id`, switches to the Hub's assigned **Worker Channel (`6` or `11`) + TDMA Slot**, and activates its Dual-Link Watchdog timer.
+4. **Bounded Control & Release (`MoveToBounded` / `SetVelocityBounded` $\rightarrow$ `ReleaseUnitAccess`):**
+   The AI Hub streams bounded intents over dual-redundant ESP-NOW + Raw LoRa. When the task completes, the Hub sends `ReleaseUnitAccess` (`opcode = 0x23`), returning the units to `IdleAvailable` on Master Channel 1.
