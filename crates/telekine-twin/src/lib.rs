@@ -11,6 +11,11 @@ pub trait VirtualDevice {
     fn id(&self) -> &str;
     fn process_intent(&mut self, intent: BoundedIntent) -> bool;
     fn get_state(&self) -> Vec<f32>;
+
+    /// Indicates whether this mock device requires validation against a physical device.
+    fn requires_real_device_validation(&self) -> bool {
+        true
+    }
 }
 
 /// A mock implementation of a specific digital twin (e.g., Device A)
@@ -78,6 +83,51 @@ impl VirtualDevice for DeviceB {
     }
 }
 
+/// A mock digital twin of a specific use-case purpose device: a Factory Machine.
+#[derive(Debug)]
+pub struct FactoryMachine {
+    pub conveyer_speed: f32,
+    pub active: bool,
+}
+
+impl FactoryMachine {
+    pub fn new() -> Self {
+        Self {
+            conveyer_speed: 0.0,
+            active: false,
+        }
+    }
+}
+
+impl VirtualDevice for FactoryMachine {
+    fn id(&self) -> &str {
+        "Factory_Machine_01"
+    }
+
+    fn process_intent(&mut self, intent: BoundedIntent) -> bool {
+        match intent {
+            BoundedIntent::SetVelocityBounded { target_vel_q16, max_accel_pct, .. } => {
+                let bounded_speed = (target_vel_q16 as f32) / 65536.0 * (max_accel_pct as f32 / 100.0);
+                self.conveyer_speed = bounded_speed;
+                self.active = true;
+                true
+            }
+            BoundedIntent::EmergencyStop => {
+                self.conveyer_speed = 0.0;
+                self.active = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn get_state(&self) -> Vec<f32> {
+        vec![self.conveyer_speed, if self.active { 1.0 } else { 0.0 }]
+    }
+
+    // Automatically inherits requires_real_device_validation() -> true
+}
+
 /// A mock simulation environment representing MuJoCo or similar physics engines.
 pub struct MujocoEnv {
     pub devices: std::collections::HashMap<String, Box<dyn VirtualDevice>>,
@@ -134,6 +184,27 @@ mod tests {
         assert!(processed);
         assert!(dev_a.state_active);
         assert_eq!(dev_a.position[0], 45.0);
+    }
+
+    #[test]
+    fn test_factory_machine_requires_validation() {
+        let mut machine = FactoryMachine::new();
+        assert_eq!(machine.id(), "Factory_Machine_01");
+
+        // Assert that a newly created specific device mock demands physical validation
+        assert!(machine.requires_real_device_validation());
+
+        let intent = BoundedIntent::SetVelocityBounded {
+            target_vel_q16: (10.0 * 65536.0) as i32,
+            max_accel_pct: 50,
+            max_torque_pct: 100,
+            lease_timeout_ms: 1000,
+        };
+
+        assert!(machine.process_intent(intent));
+        let state = machine.get_state();
+        assert_eq!(state[0], 5.0); // 10.0 * 50%
+        assert_eq!(state[1], 1.0); // Active
     }
 
     #[test]
